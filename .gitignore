@@ -1,0 +1,26 @@
+# Python & virtual environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output and temp files
+output/
+.tmp_extract/
+.tmp_scan/
+.output.json
+*.epub
+
+# User config and runtime state
+config.json
+cookies.json
+last-project.json
+
+# Browser automation profiles & caches
+browser-profile/
+browser-profile-msedge/
+
+# IDE & Editor
+.idea/
+.vscode/

@@ -1,0 +1,1457 @@
+"""
+GUI Application for Kakuyomu / Syosetu Local Translator
+Simple, intuitive, and modern Tkinter interface.
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import queue
+import random
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+from glossary_manager import (
+    VALID_CATEGORIES,
+    CandidateTerm,
+    GlossaryEntry,
+    GlossaryViolation,
+    check_glossary_compliance,
+    dict_to_entries,
+    entries_to_dict,
+    export_glossary_to_file,
+    extract_candidate_terms,
+    find_affected_chapters,
+    format_glossary_prompt,
+    get_effective_glossary,
+    import_glossary_from_file,
+    load_project_glossary,
+    merge_glossaries,
+    save_project_glossary,
+    scan_novel_entities,
+)
+from source_epub import (
+    SourceChapter,
+    WorkInfo,
+    build_source_epub,
+    compute_content_hash,
+    download_binary,
+    download_chapter_images,
+    extract_epub_chapters,
+    extract_source_chapter,
+    extract_work_info,
+    get_chapter_id,
+    normalize_work_url,
+    open_work_page,
+    translated_source_epub,
+)
+from text_importer import (
+    COMMON_CHAPTER_PATTERNS,
+    DEFAULT_SPLIT_REGEX,
+    create_project_from_text,
+    import_text_source,
+    import_text_to_epub,
+)
+from main import (
+    CONFIG_PATH,
+    APP_DIR,
+    Episode,
+    _choose_browser,
+    _launch_context,
+    _select_range,
+    add_or_update_project,
+    ensure_model,
+    installed_models,
+    load_config,
+    load_json,
+    atomic_json,
+    proofread_episode,
+    safe_name,
+    select_active_page,
+    translate_episode,
+)
+from playwright.sync_api import sync_playwright
+from epub_append import build_extended_epub, create_project_from_epub, inspect_epub
+
+
+class TextRedirector:
+    """Redirects console output / log messages to a Tkinter text widget."""
+    def __init__(self, text_widget: tk.Text, queue_obj: queue.Queue):
+        self.text_widget = text_widget
+        self.queue = queue_obj
+
+    def write(self, str_val: str):
+        if str_val:
+            self.queue.put(("log", str_val))
+
+    def flush(self):
+        pass
+
+
+class TranslatorGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("小說下載與本地 AI 翻譯器 (Kakuyomu / 小說家になろう)")
+        self.geometry("1020x760")
+        self.minsize(880, 640)
+
+        self.cfg = load_config()
+        self.log_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.active_thread: threading.Thread | None = None
+        self.stop_requested = False
+
+        # Apply ttk style
+        self.style = ttk.Style(self)
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+
+        self._init_ui()
+        self._poll_queue()
+
+    def _init_ui(self):
+        # Top banner
+        top_frame = ttk.Frame(self, padding=(12, 8))
+        top_frame.pack(side=tk.TOP, fill=tk.X)
+
+        title_lbl = ttk.Label(
+            top_frame,
+            text="小說下載與本機 AI 翻譯工具",
+            font=("Microsoft JhengHei UI", 15, "bold"),
+        )
+        title_lbl.pack(side=tk.LEFT)
+
+        author_lbl = ttk.Label(
+            top_frame,
+            text="支援 Kakuyomu 與 小說家になろう | 本地 Ollama 隱私翻譯",
+            font=("Microsoft JhengHei UI", 9),
+            foreground="#666666",
+        )
+        author_lbl.pack(side=tk.LEFT, padx=12, pady=(4, 0))
+
+        # Main Notebook Tabs
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
+
+        self.tab_download = ttk.Frame(self.notebook, padding=10)
+        self.tab_import = ttk.Frame(self.notebook, padding=10)
+        self.tab_glossary = ttk.Frame(self.notebook, padding=10)
+        self.tab_translate = ttk.Frame(self.notebook, padding=10)
+        self.tab_audit = ttk.Frame(self.notebook, padding=10)
+
+        self.notebook.add(self.tab_download, text=" 1. 小說下載 (EPUB) ")
+        self.notebook.add(self.tab_import, text=" 2. TXT/MD 批次導入 ")
+        self.notebook.add(self.tab_glossary, text=" 3. 術語表管理 ")
+        self.notebook.add(self.tab_translate, text=" 4. 本機 AI 翻譯 ")
+        self.notebook.add(self.tab_audit, text=" 5. 一致性檢查與局部重譯 ")
+
+        self._setup_tab_download()
+        self._setup_tab_import()
+        self._setup_tab_glossary()
+        self._setup_tab_translate()
+        self._setup_tab_audit()
+
+        # Bottom Global Log / Status Bar
+        bot_frame = ttk.LabelFrame(self, text="即時執行日誌與狀態", padding=6)
+        bot_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=False, padx=12, pady=(0, 8))
+
+        self.log_text = tk.Text(bot_frame, height=7, wrap=tk.WORD, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        log_scroll = ttk.Scrollbar(bot_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_bar = ttk.Progressbar(self, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 4))
+
+        self.status_var = tk.StringVar(value="就緒")
+        self.status_bar = ttk.Label(self, textvariable=self.status_var, font=("Microsoft JhengHei UI", 9), relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 2))
+
+    # ==========================================
+    # Tab 1: Download Novel
+    # ==========================================
+    def _setup_tab_download(self):
+        f = self.tab_download
+
+        # URL Frame
+        url_frame = ttk.LabelFrame(f, text="作品網址與瀏覽器設定", padding=10)
+        url_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(url_frame, text="小說網址：", font=("Microsoft JhengHei UI", 9, "bold")).grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.dl_url_var = tk.StringVar(value="https://ncode.syosetu.com/n2027ci/")
+        url_entry = ttk.Entry(url_frame, textvariable=self.dl_url_var, width=65)
+        url_entry.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
+        url_frame.columnconfigure(1, weight=1)
+
+        btn_fetch_toc = ttk.Button(url_frame, text="讀取作品目錄", command=self._action_fetch_toc)
+        btn_fetch_toc.grid(row=0, column=2, padx=4, pady=4)
+
+        # Work info display
+        info_frame = ttk.LabelFrame(f, text="作品資訊與章節範圍", padding=10)
+        info_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        self.dl_info_lbl = ttk.Label(info_frame, text="尚未讀取作品目錄。請輸入作品網址後點選「讀取作品目錄」。", wraplength=800)
+        self.dl_info_lbl.pack(anchor=tk.W, pady=4)
+
+        range_frame = ttk.Frame(info_frame)
+        range_frame.pack(fill=tk.X, pady=6)
+
+        ttk.Label(range_frame, text="下載範圍：從第").pack(side=tk.LEFT)
+        self.dl_start_var = tk.StringVar(value="1")
+        self.dl_start_entry = ttk.Entry(range_frame, textvariable=self.dl_start_var, width=6)
+        self.dl_start_entry.pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(range_frame, text="章  到第").pack(side=tk.LEFT)
+        self.dl_end_var = tk.StringVar(value="1")
+        self.dl_end_entry = ttk.Entry(range_frame, textvariable=self.dl_end_var, width=6)
+        self.dl_end_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Label(range_frame, text="章（含起止章）").pack(side=tk.LEFT)
+
+        # Chapter Listbox preview
+        self.dl_toc_listbox = tk.Listbox(info_frame, height=10, selectmode=tk.EXTENDED, font=("Microsoft JhengHei UI", 9))
+        toc_scroll = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.dl_toc_listbox.yview)
+        self.dl_toc_listbox.configure(yscrollcommand=toc_scroll.set)
+        toc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.dl_toc_listbox.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        # Download button
+        btn_box = ttk.Frame(f)
+        btn_box.pack(fill=tk.X, pady=4)
+
+        self.btn_start_dl = ttk.Button(btn_box, text=" 開始下載日文原文 EPUB ", command=self._action_start_download)
+        self.btn_start_dl.pack(side=tk.RIGHT, padx=4)
+
+        self.current_work: WorkInfo | None = None
+
+    def _action_fetch_toc(self):
+        url = self.dl_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("提示", "請輸入小說網址。")
+            return
+        try:
+            work_url = normalize_work_url(url)
+            self.dl_url_var.set(work_url)
+        except Exception as exc:
+            messagebox.showerror("網址錯誤", str(exc))
+            return
+
+        self._set_busy(True, "正在讀取作品目錄……")
+        self.dl_toc_listbox.delete(0, tk.END)
+
+        def _worker():
+            try:
+                with sync_playwright() as p:
+                    ctx = _launch_context(p, self.cfg)
+                    page = select_active_page(ctx)
+                    if "kakuyomu.jp" in work_url:
+                        open_work_page(page, work_url, allow_login=True)
+                    else:
+                        page.goto(work_url, wait_until="domcontentloaded", timeout=120_000)
+                    work = extract_work_info(page, work_url)
+                    ctx.close()
+                self.log_queue.put(("toc_loaded", work))
+            except Exception as exc:
+                self.log_queue.put(("error", f"讀取目錄失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_start_download(self):
+        if not self.current_work:
+            messagebox.showwarning("提示", "請先點選「讀取作品目錄」。")
+            return
+        try:
+            start = int(self.dl_start_var.get().strip())
+            end = int(self.dl_end_var.get().strip())
+            total = len(self.current_work.episodes)
+            if not (1 <= start <= end <= total):
+                messagebox.showerror("範圍錯誤", f"章節編號範圍無效，請輸入 1 至 {total} 之間的範圍。")
+                return
+        except ValueError:
+            messagebox.showerror("輸入錯誤", "請輸入有效的數字範圍。")
+            return
+
+        work = self.current_work
+        self._set_busy(True, f"正在下載《{work.title}》第 {start} 至 {end} 章……")
+
+        def _worker():
+            try:
+                output_root = Path(self.cfg["output_dir"])
+                work_dir = output_root / safe_name(work.title) / f"日文原文_{start:04d}-{end:04d}"
+                assets_dir = work_dir / "source-assets"
+                assets_dir.mkdir(parents=True, exist_ok=True)
+                cache_path = work_dir / "source-cache.json"
+                cache: dict[str, Any] = load_json(cache_path, {})
+                chapters: list[SourceChapter] = []
+
+                # Init project glossary
+                eff_entries = get_effective_glossary(self.cfg, work_dir)
+                if not (work_dir / "glossary.json").exists() and eff_entries:
+                    save_project_glossary(work_dir, eff_entries)
+
+                delay = max(float(self.cfg.get("request_delay_seconds", 8.0)), 8.0)
+                selected = work.episodes[start - 1:end]
+
+                with sync_playwright() as p:
+                    ctx = _launch_context(p, self.cfg)
+                    page = select_active_page(ctx)
+                    if "kakuyomu.jp" in work.url:
+                        open_work_page(page, work.url, allow_login=True)
+
+                    for idx, item in enumerate(selected, start):
+                        if self.stop_requested:
+                            self.log_queue.put(("log", "使用者取消下載。\n"))
+                            break
+
+                        pct = ((idx - start) / len(selected)) * 100
+                        self.log_queue.put(("progress", pct))
+
+                        chapter_url = item["url"]
+                        expected_cid = get_chapter_id(chapter_url)
+                        record = cache.get(chapter_url) or cache.get(expected_cid)
+                        if record and record.get("paragraphs"):
+                            curr_hash = record.get("content_hash") or compute_content_hash(record["paragraphs"])
+                            chapter = SourceChapter(
+                                url=chapter_url,
+                                title=record["title"],
+                                paragraphs=record["paragraphs"],
+                                blocks=record["blocks"],
+                                chapter_id=record.get("chapter_id", expected_cid),
+                                content_hash=curr_hash,
+                            )
+                            for image in record.get("images", []):
+                                local = work_dir / image["local_path"]
+                                if local.exists():
+                                    img_dict = dict(image)
+                                    img_dict["data"] = local.read_bytes()
+                                    chapter.images.append(img_dict)
+                            self.log_queue.put(("log", f"[{idx}/{end}] 使用快取：{chapter.title} (ID: {chapter.chapter_id})\n"))
+                        else:
+                            self.log_queue.put(("log", f"[{idx}/{end}] 下載中：{item['title']}\n"))
+                            chapter = extract_source_chapter(page, item["url"], item["title"])
+                            download_chapter_images(ctx, chapter)
+                            saved_images = []
+                            for image in chapter.images:
+                                local = assets_dir / image["name"]
+                                if not local.exists():
+                                    local.write_bytes(image["data"])
+                                saved_images.append({k: v for k, v in image.items() if k != "data"} | {
+                                    "local_path": str(local.relative_to(work_dir))
+                                })
+                            cache[item["url"]] = {
+                                "chapter_id": chapter.chapter_id,
+                                "content_hash": chapter.content_hash,
+                                "title": chapter.title,
+                                "paragraphs": chapter.paragraphs,
+                                "blocks": chapter.blocks,
+                                "images": saved_images,
+                                "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            }
+                            atomic_json(cache_path, cache)
+                            time.sleep(delay + random.uniform(1.0, 3.5))
+                        chapters.append(chapter)
+
+                    cover = None
+                    if work.cover_url:
+                        try:
+                            cover = download_binary(ctx, work.cover_url)
+                        except Exception as exc:
+                            self.log_queue.put(("log", f"封面下載失敗：{exc}\n"))
+
+                    out_epub = work_dir / f"{safe_name(work.title)}_日文_{start:04d}-{end:04d}.epub"
+                    build_source_epub(work, chapters, out_epub, cover=cover)
+                    atomic_json(work_dir / "source-project.json", {
+                        "work_url": work.url, "title": work.title, "author": work.author,
+                        "start": start, "end": end, "chapter_urls": [c.url for c in chapters],
+                    })
+                    ctx.close()
+
+                self.log_queue.put(("progress", 100.0))
+                self.log_queue.put(("download_complete", str(out_epub)))
+            except Exception as exc:
+                self.log_queue.put(("error", f"下載失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ==========================================
+    # Tab 2: TXT / Markdown Batch Importer
+    # ==========================================
+    def _setup_tab_import(self):
+        f = self.tab_import
+
+        # Source Selection Frame
+        src_frame = ttk.LabelFrame(f, text="導入來源（單一全本 TXT/MD 檔案 或 多話章節資料夾）", padding=10)
+        src_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(src_frame, text="檔案/資料夾：").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.import_path_var = tk.StringVar()
+        entry_p = ttk.Entry(src_frame, textvariable=self.import_path_var, width=50)
+        entry_p.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
+        src_frame.columnconfigure(1, weight=1)
+
+        btn_box = ttk.Frame(src_frame)
+        btn_box.grid(row=0, column=2, padx=4, pady=4)
+        ttk.Button(btn_box, text="選擇單一檔案...", command=self._action_select_import_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="選擇資料夾...", command=self._action_select_import_dir).pack(side=tk.LEFT, padx=2)
+
+        # Meta & Split options
+        meta_frame = ttk.Frame(src_frame)
+        meta_frame.grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=6)
+
+        ttk.Label(meta_frame, text="作品名稱：").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.import_title_var = tk.StringVar()
+        ttk.Entry(meta_frame, textvariable=self.import_title_var, width=22).grid(row=0, column=1, sticky=tk.W, padx=4, pady=4)
+
+        ttk.Label(meta_frame, text="作者名稱：").grid(row=0, column=2, sticky=tk.W, padx=(12, 0), pady=4)
+        self.import_author_var = tk.StringVar(value="未知作者")
+        ttk.Entry(meta_frame, textvariable=self.import_author_var, width=16).grid(row=0, column=3, sticky=tk.W, padx=4, pady=4)
+
+        ttk.Label(meta_frame, text="章節切分規則：").grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.import_rule_var = tk.StringVar(value="預設智能正則 (話/章/卷/Chapter/序章/番外等)")
+        cb_rule = ttk.Combobox(
+            meta_frame,
+            textvariable=self.import_rule_var,
+            values=[
+                "預設智能正則 (話/章/卷/Chapter/序章/番外等)",
+                "Markdown 標題 (#, ##)",
+                "自訂正則表達式",
+            ],
+            state="readonly",
+            width=36,
+        )
+        cb_rule.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=4, pady=4)
+
+        self.import_custom_regex_var = tk.StringVar()
+        self.entry_custom_regex = ttk.Entry(meta_frame, textvariable=self.import_custom_regex_var, width=28)
+        self.entry_custom_regex.grid(row=1, column=3, sticky=tk.W, padx=4, pady=4)
+        self.entry_custom_regex.grid_remove()
+
+        def _on_rule_change(evt=None):
+            if self.import_rule_var.get() == "自訂正則表達式":
+                self.entry_custom_regex.grid()
+            else:
+                self.entry_custom_regex.grid_remove()
+        cb_rule.bind("<<ComboboxSelected>>", _on_rule_change)
+
+        # Chapter Preview Frame
+        prev_frame = ttk.LabelFrame(f, text="章節解析預覽列表", padding=8)
+        prev_frame.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        tree_cols = ("index", "title", "paragraphs", "chars", "url")
+        self.import_tree = ttk.Treeview(prev_frame, columns=tree_cols, show="headings", height=9)
+        self.import_tree.heading("index", text="序號")
+        self.import_tree.heading("title", text="章節標題")
+        self.import_tree.heading("paragraphs", text="段落數")
+        self.import_tree.heading("chars", text="預估字數")
+        self.import_tree.heading("url", text="來源識別")
+
+        self.import_tree.column("index", width=55, anchor=tk.CENTER)
+        self.import_tree.column("title", width=320, anchor=tk.W)
+        self.import_tree.column("paragraphs", width=80, anchor=tk.CENTER)
+        self.import_tree.column("chars", width=90, anchor=tk.CENTER)
+        self.import_tree.column("url", width=200, anchor=tk.W)
+
+        tree_scroll = ttk.Scrollbar(prev_frame, orient=tk.VERTICAL, command=self.import_tree.yview)
+        self.import_tree.configure(yscrollcommand=tree_scroll.set)
+        self.import_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.import_status_lbl = ttk.Label(f, text="請選擇檔案或資料夾後點選「預覽解析章節」。", foreground="#555555")
+        self.import_status_lbl.pack(fill=tk.X, pady=(2, 4))
+
+        # Action Buttons
+        action_bar = ttk.Frame(f)
+        action_bar.pack(fill=tk.X, pady=4)
+
+        ttk.Button(action_bar, text="🔍 預覽解析章節", command=self._action_import_preview).pack(side=tk.LEFT, padx=4)
+        ttk.Button(action_bar, text="✨ 掃描候選術語", command=self._action_import_extract_candidates).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(action_bar, text="⚡ 建立專案並直接翻譯", command=self._action_import_and_translate).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(action_bar, text="📦 打包為日文原文 EPUB", command=self._action_import_to_epub).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(action_bar, text="📖 僅建立專案資料夾", command=self._action_import_create_project_only).pack(side=tk.RIGHT, padx=4)
+
+    def _action_select_import_file(self):
+        fpath = filedialog.askopenfilename(
+            title="選擇單一 TXT 或 Markdown 檔案",
+            filetypes=[("文字/Markdown 檔案 (*.txt, *.md)", "*.txt;*.md;*.markdown"), ("所有檔案", "*.*")]
+        )
+        if fpath:
+            self.import_path_var.set(fpath)
+            p = Path(fpath)
+            if not self.import_title_var.get():
+                self.import_title_var.set(p.stem)
+            self._action_import_preview()
+
+    def _action_select_import_dir(self):
+        dpath = filedialog.askdirectory(
+            title="選擇包含章節文字檔的資料夾",
+        )
+        if dpath:
+            self.import_path_var.set(dpath)
+            p = Path(dpath)
+            if not self.import_title_var.get():
+                self.import_title_var.set(p.name)
+            self._action_import_preview()
+
+    def _get_import_regex(self) -> str | None:
+        rule = self.import_rule_var.get()
+        if rule == "Markdown 標題 (#, ##)":
+            return r"^\s*#{1,3}\s+(.+)$"
+        elif rule == "自訂正則表達式":
+            custom = self.import_custom_regex_var.get().strip()
+            return custom if custom else None
+        return None
+
+    def _action_import_preview(self):
+        path_str = self.import_path_var.get().strip()
+        if not path_str or not Path(path_str).exists():
+            messagebox.showwarning("提示", "請先選擇有效的檔案或資料夾路徑。")
+            return
+
+        src_p = Path(path_str)
+        t_input = self.import_title_var.get().strip() or (src_p.stem if src_p.is_file() else src_p.name)
+        self.import_title_var.set(t_input)
+        a_input = self.import_author_var.get().strip() or "未知作者"
+        pattern = self._get_import_regex()
+
+        for item in self.import_tree.get_children():
+            self.import_tree.delete(item)
+
+        try:
+            work, chapters = import_text_source(
+                src_p,
+                title=t_input,
+                author=a_input,
+                split_pattern=pattern,
+            )
+            self.imported_work = work
+            self.imported_chapters = chapters
+            total_chars = 0
+            for idx, ch in enumerate(chapters, 1):
+                c_cnt = sum(len(p) for p in ch.paragraphs)
+                total_chars += c_cnt
+                self.import_tree.insert("", tk.END, values=(
+                    idx, ch.title, len(ch.paragraphs), f"{c_cnt:,} 字", ch.url
+                ))
+            self.import_status_lbl.config(
+                text=f"成功解析《{work.title}》（作者：{work.author}），共 {len(chapters)} 章，累計約 {total_chars:,} 字。"
+            )
+            self.log_text.insert(tk.END, f"批次導入解析完成：共 {len(chapters)} 章，約 {total_chars:,} 字。\n")
+        except Exception as exc:
+            messagebox.showerror("解析失敗", f"無法解析文字來源：{exc}")
+
+    def _action_import_to_epub(self):
+        if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+            self._action_import_preview()
+            if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+                return
+
+        path_str = self.import_path_var.get().strip()
+        src_p = Path(path_str)
+        t_input = self.import_title_var.get().strip() or src_p.stem
+        a_input = self.import_author_var.get().strip() or "未知作者"
+        pattern = self._get_import_regex()
+
+        out_name = f"{safe_name(t_input)}_日文原文.epub"
+        out_p = Path(self.cfg.get("output_dir", "output")) / out_name
+        self._set_busy(True, f"正在打包生成 EPUB：{out_name}……")
+
+        def _worker():
+            try:
+                res_epub = import_text_to_epub(
+                    src_p,
+                    out_p,
+                    title=t_input,
+                    author=a_input,
+                    split_pattern=pattern,
+                )
+                self.log_queue.put(("download_complete", str(res_epub.resolve())))
+            except Exception as exc:
+                self.log_queue.put(("error", f"EPUB 打包失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_import_create_project_only(self):
+        if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+            self._action_import_preview()
+            if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+                return
+
+        path_str = self.import_path_var.get().strip()
+        src_p = Path(path_str)
+        t_input = self.import_title_var.get().strip() or src_p.stem
+        a_input = self.import_author_var.get().strip() or "未知作者"
+        pattern = self._get_import_regex()
+
+        work_dir = Path(self.cfg.get("output_dir", "output")) / safe_name(f"{t_input}_中文翻译")
+        try:
+            create_project_from_text(
+                src_p,
+                work_dir,
+                title=t_input,
+                author=a_input,
+                split_pattern=pattern,
+            )
+            out_epub = Path(self.cfg.get("output_dir", "output")) / f"{safe_name(t_input)}_日文原文.epub"
+            if not out_epub.exists():
+                import_text_to_epub(src_p, out_epub, title=t_input, author=a_input, split_pattern=pattern)
+            messagebox.showinfo("專案建立成功", f"翻譯專案已建立完成：\n{work_dir.resolve()}\n\n您可隨時切換至「本機 AI 翻譯」或「術語表管理」進行處理。")
+            self.log_text.insert(tk.END, f"已建立翻譯專案：{work_dir.resolve()}\n")
+        except Exception as exc:
+            messagebox.showerror("建立專案失敗", str(exc))
+
+    def _action_import_and_translate(self):
+        if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+            self._action_import_preview()
+            if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+                return
+
+        path_str = self.import_path_var.get().strip()
+        src_p = Path(path_str)
+        t_input = self.import_title_var.get().strip() or src_p.stem
+        a_input = self.import_author_var.get().strip() or "未知作者"
+        pattern = self._get_import_regex()
+
+        out_name = f"{safe_name(t_input)}_日文原文.epub"
+        out_p = Path(self.cfg.get("output_dir", "output")) / out_name
+
+        try:
+            if not out_p.exists():
+                import_text_to_epub(
+                    src_p,
+                    out_p,
+                    title=t_input,
+                    author=a_input,
+                    split_pattern=pattern,
+                )
+            self.tr_epub_var.set(str(out_p.resolve()))
+            self.notebook.select(self.tab_translate)
+            self._action_start_translate()
+        except Exception as exc:
+            messagebox.showerror("轉換失敗", str(exc))
+
+    def _action_import_extract_candidates(self):
+        if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+            self._action_import_preview()
+            if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+                return
+
+        self._set_busy(True, "正在分析導入文本並統計候選名詞……")
+        texts = []
+        for ch in self.imported_chapters:
+            texts.extend(ch.paragraphs)
+
+        def _worker():
+            try:
+                candidates = extract_candidate_terms(texts, min_count=2, top_n=120)
+                self.log_queue.put(("candidates_ready", candidates))
+            except Exception as exc:
+                self.log_queue.put(("error", f"提取候選詞失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ==========================================
+    # Tab 3: Glossary Manager
+    # ==========================================
+    def _setup_tab_glossary(self):
+        f = self.tab_glossary
+
+        # Top bar: Scope selector (Global vs Project)
+        top_bar = ttk.LabelFrame(f, text="術語表範圍與設定", padding=8)
+        top_bar.pack(fill=tk.X, pady=(0, 6))
+
+        self.glossary_scope_var = tk.StringVar(value="global")
+        rb_global = ttk.Radiobutton(top_bar, text="全域術語表 (config.json)", variable=self.glossary_scope_var, value="global", command=self._refresh_glossary_table)
+        rb_global.pack(side=tk.LEFT, padx=6)
+
+        rb_proj = ttk.Radiobutton(top_bar, text="特定作品獨立術語表 (glossary.json)", variable=self.glossary_scope_var, value="project", command=self._refresh_glossary_table)
+        rb_proj.pack(side=tk.LEFT, padx=6)
+
+        self.proj_dir_var = tk.StringVar(value="")
+        btn_choose_proj = ttk.Button(top_bar, text="選擇作品資料夾...", command=self._action_select_glossary_project)
+        btn_choose_proj.pack(side=tk.LEFT, padx=6)
+
+        self.lbl_active_glossary_path = ttk.Label(top_bar, text="全域 config.json", foreground="#555555")
+        self.lbl_active_glossary_path.pack(side=tk.LEFT, padx=8)
+
+        # Search & Filter
+        filter_bar = ttk.Frame(f)
+        filter_bar.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(filter_bar, text="搜尋：").pack(side=tk.LEFT)
+        self.glossary_search_var = tk.StringVar()
+        self.glossary_search_var.trace_add("write", lambda *_: self._filter_glossary_view())
+        entry_search = ttk.Entry(filter_bar, textvariable=self.glossary_search_var, width=25)
+        entry_search.pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(filter_bar, text="類別篩選：").pack(side=tk.LEFT, padx=(12, 0))
+        self.category_filter_var = tk.StringVar(value="全部")
+        cb_cat = ttk.Combobox(filter_bar, textvariable=self.category_filter_var, values=["全部"] + list(VALID_CATEGORIES), state="readonly", width=12)
+        cb_cat.pack(side=tk.LEFT, padx=4)
+        cb_cat.bind("<<ComboboxSelected>>", lambda *_: self._filter_glossary_view())
+
+        # Action Buttons
+        btn_box = ttk.Frame(f)
+        btn_box.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(btn_box, text="新增術語", command=self._action_add_term).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="編輯選中", command=self._action_edit_term).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="刪除選中", command=self._action_delete_term).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(btn_box, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(btn_box, text="自動提取候選術語 (秒級統計)", command=self._action_extract_candidates_gui).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="AI 深度掃描實體", command=self._action_ai_scan_entities_gui).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(btn_box, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(btn_box, text="匯入 (CSV/Excel/JSON)", command=self._action_import_glossary_gui).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="匯出術語表", command=self._action_export_glossary_gui).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="儲存更新", command=self._action_save_glossary_gui).pack(side=tk.RIGHT, padx=2)
+
+        # Table (Treeview)
+        table_frame = ttk.Frame(f)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ("source", "target", "category", "note")
+        self.glossary_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
+        self.glossary_tree.heading("source", text="日文原文 (Source)")
+        self.glossary_tree.heading("target", text="中文譯名 (Target)")
+        self.glossary_tree.heading("category", text="類別 (Category)")
+        self.glossary_tree.heading("note", text="備註說明 (Note)")
+
+        self.glossary_tree.column("source", width=220, anchor=tk.W)
+        self.glossary_tree.column("target", width=220, anchor=tk.W)
+        self.glossary_tree.column("category", width=120, anchor=tk.CENTER)
+        self.glossary_tree.column("note", width=300, anchor=tk.W)
+
+        tree_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.glossary_tree.yview)
+        self.glossary_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.glossary_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.glossary_tree.bind("<Double-1>", lambda *_: self._action_edit_term())
+
+        self.current_glossary_entries: list[GlossaryEntry] = []
+        self._refresh_glossary_table()
+
+    def _action_select_glossary_project(self):
+        selected = filedialog.askdirectory(title="選擇作品專案資料夾", initialdir=self.cfg.get("output_dir", "output"))
+        if selected:
+            self.proj_dir_var.set(selected)
+            self.glossary_scope_var.set("project")
+            self._refresh_glossary_table()
+
+    def _get_active_glossary_path(self) -> Path:
+        if self.glossary_scope_var.get() == "project" and self.proj_dir_var.get():
+            return Path(self.proj_dir_var.get()) / "glossary.json"
+        return CONFIG_PATH
+
+    def _refresh_glossary_table(self):
+        target_path = self._get_active_glossary_path()
+        self.lbl_active_glossary_path.config(text=str(target_path.resolve()))
+
+        if self.glossary_scope_var.get() == "project":
+            if self.proj_dir_var.get():
+                p = Path(self.proj_dir_var.get())
+                self.current_glossary_entries = load_project_glossary(p)
+                if not self.current_glossary_entries and not (p / "glossary.json").exists():
+                    # fallback to global
+                    self.current_glossary_entries = dict_to_entries(self.cfg.get("glossary", {}))
+            else:
+                self.current_glossary_entries = []
+        else:
+            self.current_glossary_entries = dict_to_entries(self.cfg.get("glossary", {}))
+
+        self._filter_glossary_view()
+
+    def _filter_glossary_view(self):
+        for item in self.glossary_tree.get_children():
+            self.glossary_tree.delete(item)
+
+        q = self.glossary_search_var.get().strip().lower()
+        cat_filter = self.category_filter_var.get()
+
+        for e in self.current_glossary_entries:
+            if cat_filter != "全部" and e.category != cat_filter:
+                continue
+            if q and (q not in e.source.lower() and q not in e.target.lower() and q not in e.note.lower()):
+                continue
+            self.glossary_tree.insert("", tk.END, values=(e.source, e.target, e.category, e.note))
+
+    def _action_add_term(self):
+        self._term_edit_dialog(None)
+
+    def _action_edit_term(self):
+        selected = self.glossary_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "請先點選要編輯的條目。")
+            return
+        vals = self.glossary_tree.item(selected[0], "values")
+        entry = GlossaryEntry(source=vals[0], target=vals[1], category=vals[2], note=vals[3])
+        self._term_edit_dialog(entry)
+
+    def _action_delete_term(self):
+        selected = self.glossary_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "請先點選要刪除的條目。")
+            return
+        if not messagebox.askyesno("確認刪除", f"確認刪除選中的 {len(selected)} 筆術語？"):
+            return
+
+        to_remove = set()
+        for sel in selected:
+            vals = self.glossary_tree.item(sel, "values")
+            to_remove.add(vals[0])
+
+        self.current_glossary_entries = [e for e in self.current_glossary_entries if e.source not in to_remove]
+        self._filter_glossary_view()
+        self._action_save_glossary_gui(silent=True)
+
+    def _term_edit_dialog(self, entry: GlossaryEntry | None):
+        dialog = tk.Toplevel(self)
+        dialog.title("新增/編輯術語" if entry else "新增術語")
+        dialog.geometry("450x260")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frm = ttk.Frame(dialog, padding=15)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="日文原文：").grid(row=0, column=0, sticky=tk.W, pady=4)
+        src_var = tk.StringVar(value=entry.source if entry else "")
+        entry_src = ttk.Entry(frm, textvariable=src_var, width=32)
+        entry_src.grid(row=0, column=1, sticky=tk.EW, pady=4)
+
+        ttk.Label(frm, text="中文譯名：").grid(row=1, column=0, sticky=tk.W, pady=4)
+        tgt_var = tk.StringVar(value=entry.target if entry else "")
+        entry_tgt = ttk.Entry(frm, textvariable=tgt_var, width=32)
+        entry_tgt.grid(row=1, column=1, sticky=tk.EW, pady=4)
+
+        ttk.Label(frm, text="分類：").grid(row=2, column=0, sticky=tk.W, pady=4)
+        cat_var = tk.StringVar(value=entry.category if entry else "特殊設定")
+        cb_cat = ttk.Combobox(frm, textvariable=cat_var, values=list(VALID_CATEGORIES), state="readonly", width=30)
+        cb_cat.grid(row=2, column=1, sticky=tk.EW, pady=4)
+
+        ttk.Label(frm, text="備註說明：").grid(row=3, column=0, sticky=tk.W, pady=4)
+        note_var = tk.StringVar(value=entry.note if entry else "")
+        entry_note = ttk.Entry(frm, textvariable=note_var, width=32)
+        entry_note.grid(row=3, column=1, sticky=tk.EW, pady=4)
+
+        def _save():
+            s = src_var.get().strip()
+            t = tgt_var.get().strip()
+            c = cat_var.get().strip()
+            n = note_var.get().strip()
+            if not s or not t:
+                messagebox.showerror("錯誤", "日文原文與中文譯名皆不可為空。")
+                return
+            new_e = GlossaryEntry(source=s, target=t, category=c, note=n)
+            # update
+            self.current_glossary_entries = merge_glossaries(self.current_glossary_entries, [new_e], overwrite=True)
+            self._filter_glossary_view()
+            self._action_save_glossary_gui(silent=True)
+            dialog.destroy()
+
+        btn_box = ttk.Frame(frm)
+        btn_box.grid(row=4, column=0, columnspan=2, pady=(15, 0))
+        ttk.Button(btn_box, text="確定儲存", command=_save).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_box, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=6)
+
+    def _action_save_glossary_gui(self, silent: bool = False):
+        target_path = self._get_active_glossary_path()
+        if self.glossary_scope_var.get() == "project" and self.proj_dir_var.get():
+            save_project_glossary(Path(self.proj_dir_var.get()), self.current_glossary_entries)
+            if not silent:
+                messagebox.showinfo("成功", f"已成功儲存作品專屬術語表：\n{target_path}")
+        else:
+            self.cfg["glossary"] = entries_to_dict(self.current_glossary_entries)
+            atomic_json(CONFIG_PATH, self.cfg)
+            if not silent:
+                messagebox.showinfo("成功", f"已成功更新至全域設定檔：\n{CONFIG_PATH}")
+
+    def _action_import_glossary_gui(self):
+        fpath = filedialog.askopenfilename(
+            title="選擇術語表檔案",
+            filetypes=[("支援格式", "*.csv;*.xlsx;*.xls;*.json"), ("CSV 檔案", "*.csv"), ("Excel 試算表", "*.xlsx;*.xls"), ("JSON 檔案", "*.json"), ("所有檔案", "*.*")]
+        )
+        if not fpath:
+            return
+        try:
+            entries = import_glossary_from_file(Path(fpath))
+            if not entries:
+                messagebox.showinfo("提示", "檔案中未讀取到有效術語條目。")
+                return
+            self.current_glossary_entries = merge_glossaries(self.current_glossary_entries, entries, overwrite=True)
+            self._filter_glossary_view()
+            self._action_save_glossary_gui(silent=True)
+            messagebox.showinfo("匯入成功", f"成功匯入 {len(entries)} 筆術語條目！")
+        except Exception as exc:
+            messagebox.showerror("匯入失敗", str(exc))
+
+    def _action_export_glossary_gui(self):
+        if not self.current_glossary_entries:
+            messagebox.showinfo("提示", "目前術語表為空，無法匯出。")
+            return
+        fpath = filedialog.asksaveasfilename(
+            title="匯出術語表",
+            defaultextension=".xlsx",
+            filetypes=[("Excel 試算表 (*.xlsx)", "*.xlsx"), ("CSV 檔案 (*.csv)", "*.csv"), ("JSON 檔案 (*.json)", "*.json")]
+        )
+        if not fpath:
+            return
+        try:
+            export_glossary_to_file(self.current_glossary_entries, Path(fpath))
+            messagebox.showinfo("匯出成功", f"術語表已匯出至：\n{fpath}")
+        except Exception as exc:
+            messagebox.showerror("匯出失敗", str(exc))
+
+    def _action_extract_candidates_gui(self):
+        # Pick source: EPUB or project dir
+        fpath = filedialog.askopenfilename(
+            title="選擇要提取候選名詞的日文 EPUB 電子書",
+            filetypes=[("EPUB 電子書", "*.epub"), ("所有檔案", "*.*")]
+        )
+        if not fpath:
+            return
+        self._set_busy(True, "正在提取日文文本並統計候選術語……")
+
+        def _worker():
+            try:
+                tmp = Path(self.cfg["output_dir"]) / ".tmp_extract"
+                tmp.mkdir(parents=True, exist_ok=True)
+                _, chapters = extract_epub_chapters(Path(fpath), tmp)
+                texts = []
+                for ch in chapters:
+                    texts.extend(ch.paragraphs)
+                candidates = extract_candidate_terms(texts, min_count=2, top_n=100)
+                self.log_queue.put(("candidates_ready", candidates))
+            except Exception as exc:
+                self.log_queue.put(("error", f"提取候選詞失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_ai_scan_entities_gui(self):
+        fpath = filedialog.askopenfilename(
+            title="選擇要 AI 深度識別實體的日文 EPUB 電子書",
+            filetypes=[("EPUB 電子書", "*.epub"), ("所有檔案", "*.*")]
+        )
+        if not fpath:
+            return
+        self._set_busy(True, "正在採樣內文並由 Ollama AI 深度識別 7 大分類專有名詞……")
+
+        def _worker():
+            try:
+                tmp = Path(self.cfg["output_dir"]) / ".tmp_scan"
+                tmp.mkdir(parents=True, exist_ok=True)
+                _, chapters = extract_epub_chapters(Path(fpath), tmp)
+                texts = []
+                for ch in chapters:
+                    texts.extend(ch.paragraphs)
+                ensure_model(self.cfg)
+                entries = scan_novel_entities(texts, self.cfg)
+                self.log_queue.put(("ai_entities_ready", entries))
+            except Exception as exc:
+                self.log_queue.put(("error", f"AI 識別實體失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _candidate_review_dialog(self, candidates: list[CandidateTerm] | list[GlossaryEntry]):
+        dialog = tk.Toplevel(self)
+        dialog.title(f"候選專有名詞確認與審核（共 {len(candidates)} 筆）")
+        dialog.geometry("820x540")
+        dialog.transient(self)
+
+        lbl = ttk.Label(dialog, text="勾選欲加入術語表的候選名詞，可雙擊修改中文譯名或分類：", padding=10)
+        lbl.pack(anchor=tk.W)
+
+        tree_frame = ttk.Frame(dialog, padding=(10, 0))
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("source", "target", "category", "count", "note")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="extended")
+        tree.heading("source", text="日文原文")
+        tree.heading("target", text="中文推薦譯名")
+        tree.heading("category", text="類別")
+        tree.heading("count", text="出現頻次")
+        tree.heading("note", text="備註 / 例句")
+
+        tree.column("source", width=180)
+        tree.column("target", width=180)
+        tree.column("category", width=100, anchor=tk.CENTER)
+        tree.column("count", width=80, anchor=tk.CENTER)
+        tree.column("note", width=240)
+
+        scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        for c in candidates:
+            if isinstance(c, CandidateTerm):
+                tree.insert("", tk.END, values=(c.source, c.suggested_target or c.source, c.category, c.count, c.contexts[0] if c.contexts else c.note))
+            else:
+                tree.insert("", tk.END, values=(c.source, c.target, c.category, 1, c.note))
+
+        btn_frame = ttk.Frame(dialog, padding=10)
+        btn_frame.pack(fill=tk.X)
+
+        def _import_all():
+            new_entries = []
+            for item in tree.get_children():
+                vals = tree.item(item, "values")
+                new_entries.append(GlossaryEntry(source=vals[0], target=vals[1], category=vals[2], note=vals[4]))
+            self.current_glossary_entries = merge_glossaries(self.current_glossary_entries, new_entries, overwrite=False)
+            self._filter_glossary_view()
+            self._action_save_glossary_gui(silent=True)
+            messagebox.showinfo("完成", f"已成功將 {len(new_entries)} 筆候選術語加入術語表！")
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="一鍵全部匯入術語表", command=_import_all).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="關閉", command=dialog.destroy).pack(side=tk.RIGHT, padx=4)
+
+    # ==========================================
+    # Tab 3: Translate Novel
+    # ==========================================
+    def _setup_tab_translate(self):
+        f = self.tab_translate
+
+        # Source Selection
+        src_frame = ttk.LabelFrame(f, text="日文原文來源與模式設定", padding=10)
+        src_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(src_frame, text="日文 EPUB 檔案：").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.tr_epub_var = tk.StringVar()
+        entry_epub = ttk.Entry(src_frame, textvariable=self.tr_epub_var, width=60)
+        entry_epub.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
+        src_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(src_frame, text="選擇 EPUB...", command=self._action_select_tr_epub).grid(row=0, column=2, padx=4, pady=4)
+
+        # Target Language & Translation Mode
+        opt_frame = ttk.Frame(src_frame)
+        opt_frame.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=6)
+
+        ttk.Label(opt_frame, text="輸出用字：").pack(side=tk.LEFT)
+        self.tr_lang_var = tk.StringVar(value="繁體中文")
+        ttk.Radiobutton(opt_frame, text="繁體中文", variable=self.tr_lang_var, value="繁體中文").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(opt_frame, text="簡體中文", variable=self.tr_lang_var, value="簡體中文").pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(opt_frame, text="翻譯模式：").pack(side=tk.LEFT, padx=(20, 0))
+        self.tr_mode_var = tk.StringVar(value="quality")
+        ttk.Radiobutton(opt_frame, text="快速 (8B)", variable=self.tr_mode_var, value="fast").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(opt_frame, text="質量 (14B)", variable=self.tr_mode_var, value="quality").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(opt_frame, text="混合模式 (8B初譯+14B校對)", variable=self.tr_mode_var, value="hybrid").pack(side=tk.LEFT, padx=4)
+
+        # Append to existing
+        self.tr_append_var = tk.BooleanVar(value=False)
+        cb_append = ttk.Checkbutton(src_frame, text="追加到已有中文 EPUB 母版（保留原有排版/插圖）", variable=self.tr_append_var)
+        cb_append.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=4)
+
+        # Progress / action buttons
+        btn_box = ttk.Frame(f)
+        btn_box.pack(fill=tk.X, pady=6)
+
+        self.btn_start_tr = ttk.Button(btn_box, text=" 開始本機 AI 翻譯 ", command=self._action_start_translate)
+        self.btn_start_tr.pack(side=tk.RIGHT, padx=4)
+
+        self.btn_stop = ttk.Button(btn_box, text=" 中止 ", command=self._action_stop, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.RIGHT, padx=4)
+
+    def _action_select_tr_epub(self):
+        fpath = filedialog.askopenfilename(
+            title="選擇需要翻譯的日文 EPUB",
+            filetypes=[("EPUB 電子書", "*.epub"), ("所有檔案", "*.*")]
+        )
+        if fpath:
+            self.tr_epub_var.set(fpath)
+
+    def _action_stop(self):
+        self.stop_requested = True
+        self.status_var.set("正在中止操作……")
+
+    def _action_start_translate(self):
+        epub_str = self.tr_epub_var.get().strip()
+        if not epub_str or not Path(epub_str).exists():
+            messagebox.showwarning("提示", "請先選擇有效的日文 EPUB 檔案。")
+            return
+
+        source = Path(epub_str)
+        lang = self.tr_lang_var.get()
+        mode_val = self.tr_mode_var.get()
+
+        # Update model profile
+        if mode_val == "fast":
+            self.cfg["profile"] = "快速"
+            self.cfg["model"] = "qwen3:8b"
+            self.cfg["dual_stage"] = False
+        elif mode_val == "quality":
+            self.cfg["profile"] = "質量"
+            self.cfg["model"] = "qwen3:14b"
+            self.cfg["dual_stage"] = False
+        else:
+            self.cfg["profile"] = "混合"
+            self.cfg["model"] = "qwen3:8b"
+            self.cfg["review_model"] = "qwen3:14b"
+            self.cfg["dual_stage"] = True
+
+        self.cfg["target_language"] = lang
+        self.stop_requested = False
+        self._set_busy(True, f"正在開始翻譯《{source.stem}》……")
+        self.btn_stop.config(state=tk.NORMAL)
+
+        def _worker():
+            try:
+                ensure_model(self.cfg)
+                if self.cfg.get("dual_stage"):
+                    ensure_model(self.cfg, self.cfg["review_model"])
+
+                work_dir = Path(self.cfg["output_dir"]) / safe_name(source.stem + "_中文翻譯")
+                work_dir.mkdir(parents=True, exist_ok=True)
+                assets_dir = work_dir / "assets"
+
+                metadata, chapters = extract_epub_chapters(source, assets_dir)
+                eff_entries = get_effective_glossary(self.cfg, work_dir)
+                if not (work_dir / "glossary.json").exists() and eff_entries:
+                    save_project_glossary(work_dir, eff_entries)
+
+                ch_cfg = dict(self.cfg)
+                ch_cfg["target_language"] = lang
+                ch_cfg["glossary"] = entries_to_dict(eff_entries)
+
+                # Translate metadata
+                meta_values = [metadata.get("title", source.stem)]
+                if metadata.get("description"):
+                    meta_values.append(metadata["description"])
+                meta_episode = Episode(url="epub://metadata", work_title="", episode_title="作品資訊",
+                                       paragraphs=meta_values,
+                                       blocks=[{"type": "text", "text": v} for v in meta_values])
+                meta_draft = translate_episode(meta_episode, ch_cfg, work_dir)
+                meta_final = proofread_episode(meta_episode, meta_draft, ch_cfg, work_dir) if ch_cfg.get("dual_stage") else meta_draft
+                metadata["title"] = meta_final[0]
+                if len(meta_final) > 1:
+                    metadata["description"] = meta_final[1]
+
+                translated_chapters: list[SourceChapter] = []
+                for idx, ch in enumerate(chapters, 1):
+                    if self.stop_requested:
+                        self.log_queue.put(("log", "使用者中止翻譯。\n"))
+                        break
+
+                    pct = ((idx - 1) / len(chapters)) * 100
+                    self.log_queue.put(("progress", pct))
+                    self.log_queue.put(("log", f"[{idx}/{len(chapters)}] 翻譯中：{ch.title}\n"))
+
+                    ep = Episode(url=ch.url, work_title="", episode_title=ch.title,
+                                 paragraphs=ch.paragraphs, blocks=ch.blocks)
+                    title_ep = Episode(url=ch.url + "#title", work_title="", episode_title=ch.title,
+                                       paragraphs=[ch.title], blocks=[{"type": "text", "text": ch.title}])
+                    t_draft = translate_episode(title_ep, ch_cfg, work_dir)
+                    t_final = proofread_episode(title_ep, t_draft, ch_cfg, work_dir)[0] if ch_cfg.get("dual_stage") else t_draft[0]
+                    ep.episode_title = t_final
+
+                    drafts = translate_episode(ep, ch_cfg, work_dir)
+                    translations = proofread_episode(ep, drafts, ch_cfg, work_dir) if ch_cfg.get("dual_stage") else drafts
+
+                    translated_ch = SourceChapter(url=ch.url, title=t_final, paragraphs=translations,
+                                                  blocks=ch.blocks, images=ch.images)
+                    translated_chapters.append(translated_ch)
+
+                    if idx % 5 == 0 or idx == len(chapters):
+                        out_epub = work_dir / f"{safe_name(metadata['title'])}_{'繁中' if '繁' in lang else '簡中'}.epub"
+                        translated_source_epub(metadata, translated_chapters, out_epub, lang)
+                        self.log_queue.put(("log", f"已儲存階段 EPUB：{out_epub.name}\n"))
+
+                out_epub = work_dir / f"{safe_name(metadata['title'])}_{'繁中' if '繁' in lang else '簡中'}.epub"
+                translated_source_epub(metadata, translated_chapters, out_epub, lang)
+                self.log_queue.put(("progress", 100.0))
+                self.log_queue.put(("translate_complete", str(out_epub)))
+            except Exception as exc:
+                self.log_queue.put(("error", f"翻譯失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ==========================================
+    # Tab 4: Audit & Scope Re-translation
+    # ==========================================
+    def _setup_tab_audit(self):
+        f = self.tab_audit
+
+        top_f = ttk.LabelFrame(f, text="作品專案與合規性稽核", padding=10)
+        top_f.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(top_f, text="專案資料夾：").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.audit_proj_var = tk.StringVar()
+        entry_proj = ttk.Entry(top_f, textvariable=self.audit_proj_var, width=55)
+        entry_proj.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
+        top_f.columnconfigure(1, weight=1)
+
+        ttk.Button(top_f, text="選擇專案...", command=self._action_select_audit_proj).grid(row=0, column=2, padx=4, pady=4)
+        ttk.Button(top_f, text="一鍵檢查譯文合規性", command=self._action_audit_compliance).grid(row=0, column=3, padx=4, pady=4)
+
+        # Violations Table
+        lbl_v = ttk.Label(f, text="術語合規警示清單（日文原文有出現但中文譯文未落實）：", font=("Microsoft JhengHei UI", 9, "bold"))
+        lbl_v.pack(anchor=tk.W, pady=(4, 2))
+
+        v_frame = ttk.Frame(f)
+        v_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        v_cols = ("chapter", "para", "category", "source", "expected", "original", "translated")
+        self.violation_tree = ttk.Treeview(v_frame, columns=v_cols, show="headings", selectmode="extended")
+        self.violation_tree.heading("chapter", text="章節")
+        self.violation_tree.heading("para", text="段落")
+        self.violation_tree.heading("category", text="分類")
+        self.violation_tree.heading("source", text="日文原文")
+        self.violation_tree.heading("expected", text="應譯為")
+        self.violation_tree.heading("original", text="原文片段")
+        self.violation_tree.heading("translated", text="譯文片段")
+
+        self.violation_tree.column("chapter", width=120)
+        self.violation_tree.column("para", width=60, anchor=tk.CENTER)
+        self.violation_tree.column("category", width=90, anchor=tk.CENTER)
+        self.violation_tree.column("source", width=130)
+        self.violation_tree.column("expected", width=130)
+        self.violation_tree.column("original", width=220)
+        self.violation_tree.column("translated", width=220)
+
+        v_scroll = ttk.Scrollbar(v_frame, orient=tk.VERTICAL, command=self.violation_tree.yview)
+        self.violation_tree.configure(yscrollcommand=v_scroll.set)
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.violation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Local Re-translation box
+        re_box = ttk.LabelFrame(f, text="按術語影響範圍局部重譯 (免全本重翻)", padding=10)
+        re_box.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(re_box, text="指定日文術語：").pack(side=tk.LEFT)
+        self.re_terms_var = tk.StringVar()
+        entry_terms = ttk.Entry(re_box, textvariable=self.re_terms_var, width=35)
+        entry_terms.pack(side=tk.LEFT, padx=6)
+        ttk.Label(re_box, text="(多個術語以逗號分隔，或輸入 'all')").pack(side=tk.LEFT)
+
+        ttk.Button(re_box, text="分析影響範圍並局部重譯", command=self._action_scope_retranslate_gui).pack(side=tk.RIGHT, padx=4)
+
+    def _action_select_audit_proj(self):
+        fpath = filedialog.askdirectory(title="選擇作品專案資料夾", initialdir=self.cfg.get("output_dir", "output"))
+        if fpath:
+            self.audit_proj_var.set(fpath)
+
+    def _action_audit_compliance(self):
+        p_str = self.audit_proj_var.get().strip()
+        if not p_str or not Path(p_str).exists():
+            messagebox.showwarning("提示", "請先選擇作品專案資料夾。")
+            return
+
+        p = Path(p_str)
+        proj_file = p / "project.json"
+        if not proj_file.exists():
+            messagebox.showerror("錯誤", "專案中找不到 project.json。")
+            return
+
+        self._set_busy(True, "正在審���專案譯文術語合規性……")
+        for item in self.violation_tree.get_children():
+            self.violation_tree.delete(item)
+
+        def _worker():
+            try:
+                project = load_json(proj_file, {})
+                eff_entries = get_effective_glossary(self.cfg, p)
+                total_v = 0
+                for ch in project.get("chapters", []):
+                    ch_title = ch.get("title", "")
+                    ja = ch.get("japanese", []) or ch.get("source_paragraphs", [])
+                    zh = ch.get("translation", []) or ch.get("paragraphs", [])
+                    if ja and zh:
+                        violations, _ = check_glossary_compliance(ja, zh, eff_entries)
+                        for v in violations:
+                            total_v += 1
+                            self.log_queue.put(("violation", (ch_title, v)))
+                self.log_queue.put(("audit_complete", total_v))
+            except Exception as exc:
+                self.log_queue.put(("error", f"合規審查失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_scope_retranslate_gui(self):
+        p_str = self.audit_proj_var.get().strip()
+        if not p_str or not Path(p_str).exists():
+            messagebox.showwarning("提示", "請先選擇作品專案資料夾。")
+            return
+        p = Path(p_str)
+        proj_file = p / "project.json"
+        if not proj_file.exists():
+            messagebox.showerror("錯誤", "專案中找不到 project.json。")
+            return
+
+        terms_str = self.re_terms_var.get().strip()
+        if not terms_str:
+            messagebox.showwarning("提示", "請輸入需要局部重譯的日文術語。")
+            return
+
+        project = load_json(proj_file, {})
+        chapters = project.get("chapters", [])
+        eff_entries = get_effective_glossary(self.cfg, p)
+        eff_dict = entries_to_dict(eff_entries)
+
+        if terms_str.lower() == "all":
+            query_terms = list(eff_dict.keys())
+        else:
+            query_terms = [t.strip() for t in re.split(r"[,，、\s]+", terms_str) if t.strip()]
+
+        affected = find_affected_chapters(chapters, query_terms)
+        if not affected:
+            messagebox.showinfo("無受影響章節", "專案中未找到包含指定術語的章節段落，無須重譯。")
+            return
+
+        total_paras = sum(len(a["affected_paragraphs"]) for a in affected)
+        msg = f"分析結果：共 {len(affected)} / {len(chapters)} 個章節（{total_paras} 個段落）受影響。\n\n是否立即執行局部重譯並更新 EPUB？"
+        if not messagebox.askyesno("確認局部重譯", msg):
+            return
+
+        self._set_busy(True, f"正在對 {len(affected)} 個受影響章節進行局部重譯……")
+
+        def _worker():
+            try:
+                ensure_model(self.cfg)
+                if self.cfg.get("dual_stage"):
+                    ensure_model(self.cfg, self.cfg["review_model"])
+
+                ch_cfg = dict(self.cfg)
+                ch_cfg["target_language"] = project.get("language", self.cfg.get("target_language", "繁體中文"))
+                ch_cfg["glossary"] = eff_dict
+
+                for idx, item in enumerate(affected, 1):
+                    ch_idx = item["index"] - 1
+                    ch_rec = chapters[ch_idx]
+                    title = ch_rec.get("title", f"第 {item['index']} 章")
+
+                    pct = (idx / len(affected)) * 100
+                    self.log_queue.put(("progress", pct))
+                    self.log_queue.put(("log", f"[局部重譯 {idx}/{len(affected)}] {title}\n"))
+
+                    ja_paras = ch_rec.get("japanese", []) or ch_rec.get("source_paragraphs", [])
+                    if not ja_paras:
+                        continue
+
+                    blocks = ch_rec.get("blocks", [])
+                    ep_blocks = []
+                    for b in blocks:
+                        if b.get("type") == "image":
+                            ep_blocks.append({"type": "image", "url": b.get("key", ""), "alt": b.get("alt", "")})
+                        else:
+                            ep_blocks.append({"type": "text", "text": ""})
+
+                    ep = Episode(url=ch_rec.get("url", f"ch_{item['index']}"), work_title="",
+                                 episode_title=title, paragraphs=ja_paras, blocks=ep_blocks)
+
+                    drafts = translate_episode(ep, ch_cfg, p)
+                    translations = proofread_episode(ep, drafts, ch_cfg, p) if ch_cfg.get("dual_stage") else drafts
+
+                    images = ch_rec.get("images", [])
+                    add_or_update_project(ep, translations, p, ch_cfg, images,
+                                          drafts=drafts if ch_cfg.get("dual_stage") else None, build_now=False)
+
+                rebuilt = load_json(proj_file, {})
+                out_epub = build_extended_epub(rebuilt, p)
+                self.log_queue.put(("progress", 100.0))
+                self.log_queue.put(("retranslate_complete", str(out_epub)))
+            except Exception as exc:
+                self.log_queue.put(("error", f"局部重譯失敗：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ==========================================
+    # Global State & Helpers
+    # ==========================================
+    def _set_busy(self, busy: bool, status_msg: str = ""):
+        if busy:
+            self.status_var.set(status_msg)
+            self.progress_var.set(0.0)
+            if hasattr(self, "btn_start_dl"):
+                self.btn_start_dl.config(state=tk.DISABLED)
+            if hasattr(self, "btn_start_tr"):
+                self.btn_start_tr.config(state=tk.DISABLED)
+        else:
+            self.status_var.set("就緒")
+            if hasattr(self, "btn_start_dl"):
+                self.btn_start_dl.config(state=tk.NORMAL)
+            if hasattr(self, "btn_start_tr"):
+                self.btn_start_tr.config(state=tk.NORMAL)
+            if hasattr(self, "btn_stop"):
+                self.btn_stop.config(state=tk.DISABLED)
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg_type, payload = self.log_queue.get_nowait()
+                if msg_type == "log":
+                    self.log_text.insert(tk.END, payload)
+                    self.log_text.see(tk.END)
+                elif msg_type == "progress":
+                    self.progress_var.set(payload)
+                elif msg_type == "error":
+                    self._set_busy(False)
+                    self.log_text.insert(tk.END, f"[錯誤] {payload}\n")
+                    self.log_text.see(tk.END)
+                    messagebox.showerror("執行錯誤", payload)
+                elif msg_type == "toc_loaded":
+                    self._set_busy(False)
+                    work: WorkInfo = payload
+                    self.current_work = work
+                    self.dl_info_lbl.config(
+                        text=f"作品：{work.title} | 作者：{work.author or '未提供'} | 可訪問章節：{len(work.episodes)} 章"
+                    )
+                    self.dl_start_var.set("1")
+                    self.dl_end_var.set(str(len(work.episodes)))
+                    for i, ep in enumerate(work.episodes, 1):
+                        self.dl_toc_listbox.insert(tk.END, f"{i:4d}. {ep['title']}")
+                    self.log_text.insert(tk.END, f"成功讀取作品《{work.title}》目錄，共 {len(work.episodes)} 章。\n")
+                elif msg_type == "download_complete":
+                    self._set_busy(False)
+                    self.log_text.insert(tk.END, f"日文 EPUB 下載完成：{payload}\n")
+                    messagebox.showinfo("下載完成", f"日文原文 EPUB 已成功生成：\n{payload}")
+                elif msg_type == "translate_complete":
+                    self._set_busy(False)
+                    self.log_text.insert(tk.END, f"中文 EPUB 翻譯完成：{payload}\n")
+                    messagebox.showinfo("翻譯完成", f"中文 EPUB 電子書已成功生成：\n{payload}")
+                elif msg_type == "candidates_ready":
+                    self._set_busy(False)
+                    self._candidate_review_dialog(payload)
+                elif msg_type == "ai_entities_ready":
+                    self._set_busy(False)
+                    self._candidate_review_dialog(payload)
+                elif msg_type == "violation":
+                    ch_title, v = payload
+                    self.violation_tree.insert("", tk.END, values=(
+                        ch_title, v.paragraph_index, v.category, v.source, v.expected_target,
+                        v.original_text[:50], v.translated_text[:50]
+                    ))
+                elif msg_type == "audit_complete":
+                    self._set_busy(False)
+                    total_v = payload
+                    if total_v == 0:
+                        messagebox.showinfo("合規審查結果", "專案中所有章節皆符合術語表規範，未發現違規！")
+                    else:
+                        messagebox.showwarning("合規審查結果", f"審查完成，共發現 {total_v} 處術語合規警示。")
+                elif msg_type == "retranslate_complete":
+                    self._set_busy(False)
+                    self.log_text.insert(tk.END, f"局部重譯完成！EPUB 已更新：{payload}\n")
+                    messagebox.showinfo("局部重譯完成", f"受影響章節已局部重譯完成，EPUB 電子書已更新：\n{payload}")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+
+def main():
+    app = TranslatorGUI()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

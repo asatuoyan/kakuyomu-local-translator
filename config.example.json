@@ -1,0 +1,22 @@
+{
+  "ollama_url": "http://127.0.0.1:11434",
+  "model": "qwen3:14b",
+  "custom_model": "qwen3:14b",
+  "target_language": "繁體中文",
+  "output_dir": "output",
+  "browser_profile_dir": "browser-profile",
+  "browser_engine": "msedge",
+  "browser_executable": "",
+  "headless": false,
+  "translation_chunk_chars": 2200,
+  "context_chars": 1200,
+  "review_model": "qwen3:14b",
+  "review_chunk_chars": 1400,
+  "review_context_chars": 2600,
+  "request_timeout_seconds": 600,
+  "request_delay_seconds": 8.0,
+  "temperature": 0.2,
+  "glossary": {
+    "例：固有人名": "例：固定譯名"
+  }
+}
