@@ -399,10 +399,13 @@ class TranslatorGUI(tk.Tk):
         entry_p.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
         src_frame.columnconfigure(1, weight=1)
 
-        btn_box = ttk.Frame(src_frame)
-        btn_box.grid(row=0, column=2, padx=4, pady=4)
-        ttk.Button(btn_box, text="選擇單一檔案...", command=self._action_select_import_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="選擇資料夾...", command=self._action_select_import_dir).pack(side=tk.LEFT, padx=2)
+        # Merged source selection button
+        btn_src_menu = ttk.Menubutton(src_frame, text=" 📂 選擇來源 ▾ ")
+        src_menu = tk.Menu(btn_src_menu, tearoff=0)
+        src_menu.add_command(label="📄 選擇單一文字檔 (*.txt, *.md)...", command=self._action_select_import_file)
+        src_menu.add_command(label="📁 選擇多話章節資料夾...", command=self._action_select_import_dir)
+        btn_src_menu["menu"] = src_menu
+        btn_src_menu.grid(row=0, column=2, padx=4, pady=4)
 
         # Meta & Split options
         meta_frame = ttk.Frame(src_frame)
@@ -476,9 +479,14 @@ class TranslatorGUI(tk.Tk):
         ttk.Button(action_bar, text="🔍 預覽解析章節", command=self._action_import_preview).pack(side=tk.LEFT, padx=4)
         ttk.Button(action_bar, text="✨ 掃描候選術語", command=self._action_import_extract_candidates).pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(action_bar, text="⚡ 建立專案並直接翻譯", command=self._action_import_and_translate).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(action_bar, text="📦 打包為日文原文 EPUB", command=self._action_import_to_epub).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(action_bar, text="📖 僅建立專案資料夾", command=self._action_import_create_project_only).pack(side=tk.RIGHT, padx=4)
+        # Merged Export & Processing Menu
+        btn_export_menu = ttk.Menubutton(action_bar, text=" 🚀 導出與處理 ▾ ")
+        export_menu = tk.Menu(btn_export_menu, tearoff=0)
+        export_menu.add_command(label="⚡ 建立專案並直接翻譯", command=self._action_import_and_translate)
+        export_menu.add_command(label="📦 打包為日文原文 EPUB", command=self._action_import_to_epub)
+        export_menu.add_command(label="📖 僅建立專案資料夾", command=self._action_import_create_project_only)
+        btn_export_menu["menu"] = export_menu
+        btn_export_menu.pack(side=tk.RIGHT, padx=4)
 
     def _action_select_import_file(self):
         fpath = filedialog.askopenfilename(
@@ -704,16 +712,29 @@ class TranslatorGUI(tk.Tk):
         btn_box = ttk.Frame(f)
         btn_box.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Button(btn_box, text="新增術語", command=self._action_add_term).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="編輯選中", command=self._action_edit_term).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="刪除選中", command=self._action_delete_term).pack(side=tk.LEFT, padx=2)
+        # Term editing actions
+        ttk.Button(btn_box, text="➕ 新增術語", command=self._action_add_term).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="✏️ 編輯選中", command=self._action_edit_term).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="🗑️ 刪除選中", command=self._action_delete_term).pack(side=tk.LEFT, padx=2)
         ttk.Separator(btn_box, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(btn_box, text="自動提取候選術語 (秒級統計)", command=self._action_extract_candidates_gui).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="AI 深度掃描實體", command=self._action_ai_scan_entities_gui).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(btn_box, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(btn_box, text="匯入 (CSV/Excel/JSON)", command=self._action_import_glossary_gui).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="匯出術語表", command=self._action_export_glossary_gui).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="儲存更新", command=self._action_save_glossary_gui).pack(side=tk.RIGHT, padx=2)
+
+        # Merged Extraction & Recognition Menu
+        btn_extract_menu = ttk.Menubutton(btn_box, text=" 🔍 術語提取/識別 ▾ ")
+        extract_menu = tk.Menu(btn_extract_menu, tearoff=0)
+        extract_menu.add_command(label="⚡ 快速提取候選術語 (秒級統計)", command=self._action_extract_candidates_gui)
+        extract_menu.add_command(label="🤖 AI 深度實體識別 (Ollama)", command=self._action_ai_scan_entities_gui)
+        btn_extract_menu["menu"] = extract_menu
+        btn_extract_menu.pack(side=tk.LEFT, padx=2)
+
+        # Merged Import & Export Menu
+        btn_io_menu = ttk.Menubutton(btn_box, text=" 📁 匯入/匯出 ▾ ")
+        io_menu = tk.Menu(btn_io_menu, tearoff=0)
+        io_menu.add_command(label="📥 匯入術語表 (CSV / Excel / JSON)...", command=self._action_import_glossary_gui)
+        io_menu.add_command(label="📤 匯出術語表 (Excel / CSV / JSON)...", command=self._action_export_glossary_gui)
+        btn_io_menu["menu"] = io_menu
+        btn_io_menu.pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(btn_box, text="💾 儲存更新", command=self._action_save_glossary_gui).pack(side=tk.RIGHT, padx=2)
 
         # Table (Treeview)
         table_frame = ttk.Frame(f)
