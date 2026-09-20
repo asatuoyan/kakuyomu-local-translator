@@ -47,6 +47,8 @@ from text_importer import (
     COMMON_CHAPTER_PATTERNS,
     DEFAULT_SPLIT_REGEX,
     create_project_from_text,
+    detect_text_language,
+    get_language_display_name,
     import_text_source,
     import_text_to_epub,
 )
@@ -1544,8 +1546,8 @@ def manage_glossary_menu(cfg: dict[str, Any]) -> None:
 
 
 def import_text_batch_flow(cfg: dict[str, Any]) -> None:
-    print("\n================ TXT / Markdown 批次導入 ================")
-    print("支援格式：單一全本 .txt / .md 檔案（自動正則分章），或包含多話章節的資料夾（自然排序）")
+    print("\n================ TXT / Markdown / UMD / JAR 批次導入 ================")
+    print("支援格式：全本 .txt / .md / .umd / .jar 檔案（自動正則分章），或包含多話章節的資料夾（自然排序）")
     path_str = input("請輸入檔案或資料夾路徑：").strip().strip('"')
     if not path_str:
         print("已取消導入。")
@@ -1556,7 +1558,7 @@ def import_text_batch_flow(cfg: dict[str, Any]) -> None:
         return
 
     custom_regex = None
-    if src_path.is_file():
+    if src_path.is_file() and src_path.suffix.lower() not in {".umd", ".jar"}:
         print("\n章節切分規則：")
         print("  1. 預設標準規則（第X話/章/卷、Chapter X、Markdown # 標題、序章/終章/番外編等）")
         print("  2. Markdown 標題切分（# 或 ##）")
@@ -1565,7 +1567,7 @@ def import_text_batch_flow(cfg: dict[str, Any]) -> None:
         if r_choice == "2":
             custom_regex = r"^\s*#{1,3}\s+(.+)$"
         elif r_choice == "3":
-            custom_regex = input("請輸入切分章節的正則表���式：").strip()
+            custom_regex = input("請輸入切分章節的正則表達式：").strip()
 
     title_input = input(f"作品書名 [{src_path.stem}]：").strip() or src_path.stem
     author_input = input("作者名稱 [未知作者]：").strip() or "未知作者"
@@ -1581,7 +1583,13 @@ def import_text_batch_flow(cfg: dict[str, Any]) -> None:
         print(f"解析失敗：{exc}")
         return
 
-    print(f"\n成功解析作品《{work.title}》（作者：{work.author}），共 {len(chapters)} 章。")
+    sample_paras = []
+    for ch in chapters[:10]:
+        sample_paras.extend(ch.paragraphs[:3])
+    detected_lang = detect_text_language(sample_paras)
+    lang_name = get_language_display_name(detected_lang)
+
+    print(f"\n成功解析作品《{work.title}》（作者：{work.author}，自動辨識語系：{lang_name}），共 {len(chapters)} 章。")
     print("章節預覽（前 5 章）：")
     for i, ch in enumerate(chapters[:5], 1):
         char_count = sum(len(p) for p in ch.paragraphs)
@@ -1590,44 +1598,129 @@ def import_text_batch_flow(cfg: dict[str, Any]) -> None:
         print(f"  ... 其餘 {len(chapters) - 5} 章已略過預覽。")
 
     print("\n請選擇後續處理方式：")
-    print("  1. 打包生成日文原文 EPUB（可用於日後整本翻譯或提取術語）")
-    print("  2. 建立翻譯專案並立即開始本機 AI 翻譯")
-    print("  3. 僅建立專案資料夾（以便手動配置獨立術語表）")
-    action = input("請輸入 1-3 [1]：").strip() or "1"
-
-    if action == "1":
-        output_name = f"{safe_name(work.title)}_日文原文.epub"
-        output_path = Path(cfg["output_dir"]) / output_name
-        import_text_to_epub(
-            src_path,
-            output_path,
-            title=work.title,
-            author=work.author,
-            description=work.description,
-            split_pattern=custom_regex,
-        )
-        print(f"\n日文原文 EPUB 打包成功：{output_path.resolve()}")
-    elif action in {"2", "3"}:
-        work_dir = Path(cfg["output_dir"]) / safe_name(f"{work.title}_中文翻译")
-        create_project_from_text(
-            src_path,
-            work_dir,
-            title=work.title,
-            author=work.author,
-            description=work.description,
-            language=cfg.get("target_language", "繁體中文"),
-            split_pattern=custom_regex,
-        )
-        temp_epub = Path(cfg["output_dir"]) / f"{safe_name(work.title)}_日文原文.epub"
-        if not temp_epub.exists():
-            import_text_to_epub(src_path, temp_epub, title=work.title, author=work.author, split_pattern=custom_regex)
-        print(f"\n專案資料夾已成功建立：{work_dir.resolve()}")
-        if action == "2":
+    if detected_lang != "ja":
+        # Chinese novel options
+        print("  1. 📦 一鍵打包為中文 EPUB 電子書")
+        print("  2. 📋 導入為中文專案（用於術語合規稽核、局部修正或接續新章節）")
+        print("  3. ⚡ 作為日文原文專案並開始本機 AI 翻譯")
+        print("  4. 📁 僅建立專案資料夾")
+        action = input("請輸入 1-4 [1]：").strip() or "1"
+        if action == "1":
+            output_name = f"{safe_name(work.title)}_中文.epub"
+            output_path = Path(cfg["output_dir"]) / output_name
+            import_text_to_epub(
+                src_path,
+                output_path,
+                title=work.title,
+                author=work.author,
+                description=work.description,
+                language="繁體中文" if detected_lang == "zh-Hant" else "簡體中文",
+                split_pattern=custom_regex,
+            )
+            print(f"\n中文 EPUB 電子書打包成功：{output_path.resolve()}")
+        elif action == "2":
+            work_dir = Path(cfg["output_dir"]) / safe_name(f"{work.title}_中文專案")
+            create_project_from_text(
+                src_path,
+                work_dir,
+                title=work.title,
+                author=work.author,
+                description=work.description,
+                language="繁體中文" if detected_lang == "zh-Hant" else "簡體中文",
+                split_pattern=custom_regex,
+                as_translated=True,
+            )
+            out_epub = Path(cfg["output_dir"]) / f"{safe_name(work.title)}_中文.epub"
+            if not out_epub.exists():
+                import_text_to_epub(src_path, out_epub, title=work.title, author=work.author, language="中文", split_pattern=custom_regex)
+            print(f"\n中文專案已建立完成：{work_dir.resolve()}")
+            print("您可使用主選單「6. 術語表管理」->「7. 檢查既有專案譯文是否違反術語表」進行稽核！")
+        elif action == "3":
+            work_dir = Path(cfg["output_dir"]) / safe_name(f"{work.title}_中文翻译")
+            create_project_from_text(
+                src_path,
+                work_dir,
+                title=work.title,
+                author=work.author,
+                description=work.description,
+                language=cfg.get("target_language", "繁體中文"),
+                split_pattern=custom_regex,
+            )
+            temp_epub = Path(cfg["output_dir"]) / f"{safe_name(work.title)}_原文.epub"
+            if not temp_epub.exists():
+                import_text_to_epub(src_path, temp_epub, title=work.title, author=work.author, split_pattern=custom_regex)
+            print(f"\n專案資料夾已成功建立：{work_dir.resolve()}")
             print("檢查 Ollama……")
             installed_models(cfg)
             while not select_model(cfg):
                 print("請重新選擇一個模型。")
             translate_source_epub(cfg, append_to_existing=False, source_override=temp_epub)
+        else:
+            work_dir = Path(cfg["output_dir"]) / safe_name(f"{work.title}_中文翻译")
+            create_project_from_text(
+                src_path,
+                work_dir,
+                title=work.title,
+                author=work.author,
+                description=work.description,
+                language=cfg.get("target_language", "繁體中文"),
+                split_pattern=custom_regex,
+            )
+            print(f"\n專案資料夾已成功建立：{work_dir.resolve()}")
+    else:
+        # Japanese source novel options
+        print("  1. ⚡ 建立翻譯專案並立即開始本機 AI 翻譯")
+        print("  2. 📦 打包生成日文原文 EPUB（可用於日後整本翻譯或提取術語）")
+        print("  3. 📁 僅建立專案資料夾（以便手動配置獨立術語表）")
+        action = input("請輸入 1-3 [1]：").strip() or "1"
+        if action == "1":
+            work_dir = Path(cfg["output_dir"]) / safe_name(f"{work.title}_中文翻译")
+            create_project_from_text(
+                src_path,
+                work_dir,
+                title=work.title,
+                author=work.author,
+                description=work.description,
+                language=cfg.get("target_language", "繁體中文"),
+                split_pattern=custom_regex,
+            )
+            temp_epub = Path(cfg["output_dir"]) / f"{safe_name(work.title)}_日文原文.epub"
+            if not temp_epub.exists():
+                import_text_to_epub(src_path, temp_epub, title=work.title, author=work.author, split_pattern=custom_regex)
+            print(f"\n專案資料夾已成功建立：{work_dir.resolve()}")
+            print("檢查 Ollama……")
+            installed_models(cfg)
+            while not select_model(cfg):
+                print("請重新選擇一個模型。")
+            translate_source_epub(cfg, append_to_existing=False, source_override=temp_epub)
+        elif action == "2":
+            output_name = f"{safe_name(work.title)}_日文原文.epub"
+            output_path = Path(cfg["output_dir"]) / output_name
+            import_text_to_epub(
+                src_path,
+                output_path,
+                title=work.title,
+                author=work.author,
+                description=work.description,
+                language="日文",
+                split_pattern=custom_regex,
+            )
+            print(f"\n日文原文 EPUB 打包成功：{output_path.resolve()}")
+        else:
+            work_dir = Path(cfg["output_dir"]) / safe_name(f"{work.title}_中文翻译")
+            create_project_from_text(
+                src_path,
+                work_dir,
+                title=work.title,
+                author=work.author,
+                description=work.description,
+                language=cfg.get("target_language", "繁體中文"),
+                split_pattern=custom_regex,
+            )
+            temp_epub = Path(cfg["output_dir"]) / f"{safe_name(work.title)}_日文原文.epub"
+            if not temp_epub.exists():
+                import_text_to_epub(src_path, temp_epub, title=work.title, author=work.author, split_pattern=custom_regex)
+            print(f"\n專案資料夾已成功建立：{work_dir.resolve()}")
 
 
 def main() -> int:
@@ -1641,7 +1734,7 @@ def main() -> int:
     print("  4. 导入已有中文 EPUB，再手动打开网页逐章续接")
     print("  5. 继续上次的网页续接项目")
     print("  6. 術語表管理（AI 實體識別/候選詞提取/多格式匯入匯出/合規檢查/局部重譯）")
-    print("  7. 批次導入 TXT / Markdown 檔案或資料夾（製作 EPUB 或建立翻譯專案）")
+    print("  7. 批次導入 TXT / Markdown / UMD / JAR 電子書（製作 EPUB 或建立翻譯專案）")
     print("  8. 開啟圖形化使用者介面 (GUI 簡易操作)")
     mode = input("请输入 1-8：").strip()
     if mode == "8":

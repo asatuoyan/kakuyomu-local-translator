@@ -479,7 +479,7 @@ def _chapter_html(chapter: SourceChapter, image_paths: dict[str, str], lang: str
             parts.append(f"<p>{html.escape(block.get('text', ''))}</p>")
         elif block.get("type") == "image" and block.get("url") in image_paths:
             parts.append(f'<p class="illustration"><img src="{html.escape(image_paths[block["url"]])}" alt="{html.escape(block.get("alt", ""))}"/></p>')
-    return "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>" + html.escape(chapter.title) + "</title></head><body>" + "\n".join(parts) + "</body></html>"
+    return "\n".join(parts)
 
 
 def build_source_epub(work: WorkInfo, chapters: list[SourceChapter], output: Path,
@@ -518,7 +518,7 @@ def build_source_epub(work: WorkInfo, chapters: list[SourceChapter], output: Pat
                 added_images.add(path)
         item = epub.EpubHtml(title=chapter.title, file_name=f"text/chapter_{index:04d}.xhtml",
                              lang=language, uid=f"chapter_{index:04d}")
-        item.content = _chapter_html(chapter, image_paths)
+        item.content = _chapter_html(chapter, image_paths, lang=language)
         item.add_item(css); book.add_item(item); spine.append(item); toc.append(item)
     book.toc = toc
     book.spine = spine
@@ -550,7 +550,8 @@ def extract_epub_chapters(source: Path, assets_dir: Path) -> tuple[dict[str, Any
         item = book.get_item_with_id(idref)
         if item is None or item.get_type() != 9 or idref in {"nav", "introduction", "cover"}:
             continue
-        soup = BeautifulSoup(item.get_content(), "html.parser")
+        content_bytes = item.get_content()
+        soup = BeautifulSoup(content_bytes.decode("utf-8", errors="replace"), "html.parser")
         title = (soup.find(["h1", "h2"]) or soup.title)
         chapter_title = _clean(title.get_text(" ", strip=True)) if title else item.get_name()
         blocks: list[dict[str, str]] = []

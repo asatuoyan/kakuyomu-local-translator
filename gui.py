@@ -57,6 +57,8 @@ from text_importer import (
     COMMON_CHAPTER_PATTERNS,
     DEFAULT_SPLIT_REGEX,
     create_project_from_text,
+    detect_text_language,
+    get_language_display_name,
     import_text_source,
     import_text_to_epub,
 )
@@ -390,7 +392,7 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_import
 
         # Source Selection Frame
-        src_frame = ttk.LabelFrame(f, text="導入來源（單一全本 TXT/MD 檔案 或 多話章節資料夾）", padding=10)
+        src_frame = ttk.LabelFrame(f, text="導入來源（單一全本 TXT / MD / UMD / JAR 檔案 或 多話章節資料夾）", padding=10)
         src_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(src_frame, text="檔案/資料夾：").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -402,7 +404,10 @@ class TranslatorGUI(tk.Tk):
         # Merged source selection button
         btn_src_menu = ttk.Menubutton(src_frame, text=" 📂 選擇來源 ▾ ")
         src_menu = tk.Menu(btn_src_menu, tearoff=0)
-        src_menu.add_command(label="📄 選擇單一文字檔 (*.txt, *.md)...", command=self._action_select_import_file)
+        src_menu.add_command(label="📄 選擇文字檔 (*.txt, *.md)...", command=self._action_select_import_file)
+        src_menu.add_command(label="📱 選擇 UMD 電子書 (*.umd)...", command=self._action_select_import_umd)
+        src_menu.add_command(label="☕ 選擇 JAR 電子書 (*.jar)...", command=self._action_select_import_jar)
+        src_menu.add_separator()
         src_menu.add_command(label="📁 選擇多話章節資料夾...", command=self._action_select_import_dir)
         btn_src_menu["menu"] = src_menu
         btn_src_menu.grid(row=0, column=2, padx=4, pady=4)
@@ -413,11 +418,32 @@ class TranslatorGUI(tk.Tk):
 
         ttk.Label(meta_frame, text="作品名稱：").grid(row=0, column=0, sticky=tk.W, pady=4)
         self.import_title_var = tk.StringVar()
-        ttk.Entry(meta_frame, textvariable=self.import_title_var, width=22).grid(row=0, column=1, sticky=tk.W, padx=4, pady=4)
+        ttk.Entry(meta_frame, textvariable=self.import_title_var, width=16).grid(row=0, column=1, sticky=tk.W, padx=4, pady=4)
 
-        ttk.Label(meta_frame, text="作者名稱：").grid(row=0, column=2, sticky=tk.W, padx=(12, 0), pady=4)
+        ttk.Label(meta_frame, text="作者名稱：").grid(row=0, column=2, sticky=tk.W, padx=(8, 0), pady=4)
         self.import_author_var = tk.StringVar(value="未知作者")
-        ttk.Entry(meta_frame, textvariable=self.import_author_var, width=16).grid(row=0, column=3, sticky=tk.W, padx=4, pady=4)
+        ttk.Entry(meta_frame, textvariable=self.import_author_var, width=12).grid(row=0, column=3, sticky=tk.W, padx=4, pady=4)
+
+        ttk.Label(meta_frame, text="檔案編碼：").grid(row=0, column=4, sticky=tk.W, padx=(8, 0), pady=4)
+        self.import_encoding_var = tk.StringVar(value="🤖 自動偵測編碼")
+        cb_enc = ttk.Combobox(
+            meta_frame,
+            textvariable=self.import_encoding_var,
+            values=[
+                "🤖 自動偵測編碼",
+                "UTF-8",
+                "UTF-8-SIG (含BOM)",
+                "Big5 (繁體中文)",
+                "GB18030 / GBK (簡體中文)",
+                "Shift-JIS / CP932 (日文)",
+                "EUC-JP (日文)",
+                "UTF-16 LE",
+                "UTF-16 BE",
+            ],
+            state="readonly",
+            width=18,
+        )
+        cb_enc.grid(row=0, column=5, sticky=tk.W, padx=4, pady=4)
 
         ttk.Label(meta_frame, text="章節切分規則：").grid(row=1, column=0, sticky=tk.W, pady=4)
         self.import_rule_var = tk.StringVar(value="預設智能正則 (話/章/卷/Chapter/序章/番外等)")
@@ -430,13 +456,32 @@ class TranslatorGUI(tk.Tk):
                 "自訂正則表達式",
             ],
             state="readonly",
-            width=36,
+            width=32,
         )
         cb_rule.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=4, pady=4)
 
+        ttk.Label(meta_frame, text="語系設定：").grid(row=1, column=3, sticky=tk.W, padx=(8, 0), pady=4)
+        self.import_lang_var = tk.StringVar(value="🤖 自動偵測語系")
+        cb_lang = ttk.Combobox(
+            meta_frame,
+            textvariable=self.import_lang_var,
+            values=[
+                "🤖 自��偵測語系",
+                "🇹🇼 中文小說 (繁體中文)",
+                "🇨🇳 中文小說 (簡體中文)",
+                "🇯🇵 日文原文",
+            ],
+            state="readonly",
+            width=18,
+        )
+        cb_lang.grid(row=1, column=4, columnspan=2, sticky=tk.W, padx=4, pady=4)
+
+        self.import_sort_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(meta_frame, text="🔀 依章節序號排序", variable=self.import_sort_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
+
         self.import_custom_regex_var = tk.StringVar()
-        self.entry_custom_regex = ttk.Entry(meta_frame, textvariable=self.import_custom_regex_var, width=28)
-        self.entry_custom_regex.grid(row=1, column=3, sticky=tk.W, padx=4, pady=4)
+        self.entry_custom_regex = ttk.Entry(meta_frame, textvariable=self.import_custom_regex_var, width=32)
+        self.entry_custom_regex.grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=4, pady=2)
         self.entry_custom_regex.grid_remove()
 
         def _on_rule_change(evt=None):
@@ -479,19 +524,52 @@ class TranslatorGUI(tk.Tk):
         ttk.Button(action_bar, text="🔍 預覽解析章節", command=self._action_import_preview).pack(side=tk.LEFT, padx=4)
         ttk.Button(action_bar, text="✨ 掃描候選術語", command=self._action_import_extract_candidates).pack(side=tk.LEFT, padx=4)
 
+        # 1-Click Pack EPUB Button
+        ttk.Button(action_bar, text="📦 一鍵打包為 EPUB 電子書", command=self._action_import_to_epub).pack(side=tk.RIGHT, padx=4)
+
         # Merged Export & Processing Menu
-        btn_export_menu = ttk.Menubutton(action_bar, text=" 🚀 導出與處理 ▾ ")
+        btn_export_menu = ttk.Menubutton(action_bar, text=" 🚀 專案導出與處理 ▾ ")
         export_menu = tk.Menu(btn_export_menu, tearoff=0)
-        export_menu.add_command(label="⚡ 建立專案並直接翻譯", command=self._action_import_and_translate)
-        export_menu.add_command(label="📦 打包為日文原文 EPUB", command=self._action_import_to_epub)
-        export_menu.add_command(label="📖 僅建立專案資料夾", command=self._action_import_create_project_only)
+        export_menu.add_command(label="📋 導入為中文專案 (術語稽核/潤色/接續)", command=self._action_import_as_chinese_project)
+        export_menu.add_command(label="⚡ 建立專案並翻譯 (日翻中)", command=self._action_import_and_translate)
+        export_menu.add_command(label="📁 僅建立空白翻譯專案", command=self._action_import_create_project_only)
         btn_export_menu["menu"] = export_menu
         btn_export_menu.pack(side=tk.RIGHT, padx=4)
 
     def _action_select_import_file(self):
         fpath = filedialog.askopenfilename(
-            title="選擇單一 TXT 或 Markdown 檔案",
-            filetypes=[("文字/Markdown 檔案 (*.txt, *.md)", "*.txt;*.md;*.markdown"), ("所有檔案", "*.*")]
+            title="選擇文字檔或電子書",
+            filetypes=[
+                ("電子書與文字檔 (*.txt, *.md, *.umd, *.jar)", "*.txt;*.md;*.markdown;*.umd;*.jar"),
+                ("純文字 / Markdown 檔案 (*.txt, *.md)", "*.txt;*.md;*.markdown"),
+                ("UMD 電子書 (*.umd)", "*.umd"),
+                ("JAR 電子書 (*.jar)", "*.jar"),
+                ("所有檔案", "*.*"),
+            ]
+        )
+        if fpath:
+            self.import_path_var.set(fpath)
+            p = Path(fpath)
+            if not self.import_title_var.get():
+                self.import_title_var.set(p.stem)
+            self._action_import_preview()
+
+    def _action_select_import_umd(self):
+        fpath = filedialog.askopenfilename(
+            title="選擇 UMD 電子書檔案",
+            filetypes=[("UMD 電子書 (*.umd)", "*.umd"), ("所有檔案", "*.*")]
+        )
+        if fpath:
+            self.import_path_var.set(fpath)
+            p = Path(fpath)
+            if not self.import_title_var.get():
+                self.import_title_var.set(p.stem)
+            self._action_import_preview()
+
+    def _action_select_import_jar(self):
+        fpath = filedialog.askopenfilename(
+            title="選擇 JAR 電子書檔案",
+            filetypes=[("JAR 電子書 (*.jar)", "*.jar"), ("所有檔案", "*.*")]
         )
         if fpath:
             self.import_path_var.set(fpath)
@@ -520,6 +598,26 @@ class TranslatorGUI(tk.Tk):
             return custom if custom else None
         return None
 
+    def _get_import_encoding(self) -> str | None:
+        enc_sel = self.import_encoding_var.get()
+        if "Big5" in enc_sel:
+            return "big5"
+        elif "GB18030" in enc_sel or "GBK" in enc_sel:
+            return "gb18030"
+        elif "Shift-JIS" in enc_sel or "CP932" in enc_sel:
+            return "cp932"
+        elif "EUC-JP" in enc_sel:
+            return "euc-jp"
+        elif "UTF-16 LE" in enc_sel:
+            return "utf-16le"
+        elif "UTF-16 BE" in enc_sel:
+            return "utf-16be"
+        elif "UTF-8-SIG" in enc_sel:
+            return "utf-8-sig"
+        elif enc_sel == "UTF-8":
+            return "utf-8"
+        return None
+
     def _action_import_preview(self):
         path_str = self.import_path_var.get().strip()
         if not path_str or not Path(path_str).exists():
@@ -531,6 +629,8 @@ class TranslatorGUI(tk.Tk):
         self.import_title_var.set(t_input)
         a_input = self.import_author_var.get().strip() or "未知作者"
         pattern = self._get_import_regex()
+        enc = self._get_import_encoding()
+        do_sort = self.import_sort_var.get()
 
         for item in self.import_tree.get_children():
             self.import_tree.delete(item)
@@ -541,20 +641,39 @@ class TranslatorGUI(tk.Tk):
                 title=t_input,
                 author=a_input,
                 split_pattern=pattern,
+                encoding=enc,
+                sort_chapters=do_sort,
             )
             self.imported_work = work
             self.imported_chapters = chapters
+            if work.title and work.title != t_input:
+                self.import_title_var.set(work.title)
+            if work.author and work.author != "未知作者":
+                self.import_author_var.set(work.author)
+
             total_chars = 0
+            sample_paras = []
             for idx, ch in enumerate(chapters, 1):
                 c_cnt = sum(len(p) for p in ch.paragraphs)
                 total_chars += c_cnt
+                if len(sample_paras) < 30:
+                    sample_paras.extend(ch.paragraphs[:3])
                 self.import_tree.insert("", tk.END, values=(
                     idx, ch.title, len(ch.paragraphs), f"{c_cnt:,} 字", ch.url
                 ))
+            detected_lang = detect_text_language(sample_paras)
+            lang_label = get_language_display_name(detected_lang)
+            if self.import_lang_var.get() == "🤖 自動偵測語系":
+                if detected_lang == "ja":
+                    self.import_lang_var.set("🇯🇵 日文原文")
+                elif detected_lang == "zh-Hans":
+                    self.import_lang_var.set("🇨🇳 中文小說 (簡體中文)")
+                else:
+                    self.import_lang_var.set("🇹🇼 中文小說 (繁體中文)")
             self.import_status_lbl.config(
-                text=f"成功解析《{work.title}》（作者：{work.author}），共 {len(chapters)} 章，累計約 {total_chars:,} 字。"
+                text=f"成功解析《{work.title}》（作者：{work.author}，語系：{lang_label}），共 {len(chapters)} 章，累計約 {total_chars:,} 字。"
             )
-            self.log_text.insert(tk.END, f"批次導入解析完成：共 {len(chapters)} 章，約 {total_chars:,} 字。\n")
+            self.log_text.insert(tk.END, f"批次導入解析完成：共 {len(chapters)} 章，約 {total_chars:,} 字（偵測為 {lang_label}）。\n")
         except Exception as exc:
             messagebox.showerror("解析失敗", f"無法解析文字來源：{exc}")
 
@@ -569,8 +688,23 @@ class TranslatorGUI(tk.Tk):
         t_input = self.import_title_var.get().strip() or src_p.stem
         a_input = self.import_author_var.get().strip() or "未知作者"
         pattern = self._get_import_regex()
+        enc = self._get_import_encoding()
+        do_sort = self.import_sort_var.get()
 
-        out_name = f"{safe_name(t_input)}_日文原文.epub"
+        lang_sel = self.import_lang_var.get()
+        if "日" in lang_sel:
+            lang_code = "日文"
+            out_name = f"{safe_name(t_input)}_日文原文.epub"
+        elif "簡" in lang_sel:
+            lang_code = "簡體中文"
+            out_name = f"{safe_name(t_input)}_中文.epub"
+        elif "繁" in lang_sel:
+            lang_code = "繁體中文"
+            out_name = f"{safe_name(t_input)}_中文.epub"
+        else:
+            lang_code = "auto"
+            out_name = f"{safe_name(t_input)}.epub"
+
         out_p = Path(self.cfg.get("output_dir", "output")) / out_name
         self._set_busy(True, f"正在打包生成 EPUB：{out_name}……")
 
@@ -581,13 +715,70 @@ class TranslatorGUI(tk.Tk):
                     out_p,
                     title=t_input,
                     author=a_input,
+                    language=lang_code,
                     split_pattern=pattern,
+                    encoding=enc,
+                    sort_chapters=do_sort,
                 )
                 self.log_queue.put(("download_complete", str(res_epub.resolve())))
             except Exception as exc:
                 self.log_queue.put(("error", f"EPUB 打包失敗：{exc}"))
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _action_import_as_chinese_project(self):
+        if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+            self._action_import_preview()
+            if not hasattr(self, "imported_chapters") or not self.imported_chapters:
+                return
+
+        path_str = self.import_path_var.get().strip()
+        src_p = Path(path_str)
+        t_input = self.import_title_var.get().strip() or src_p.stem
+        a_input = self.import_author_var.get().strip() or "未知作者"
+        pattern = self._get_import_regex()
+        enc = self._get_import_encoding()
+        do_sort = self.import_sort_var.get()
+        lang_sel = self.import_lang_var.get()
+        target_lang = "簡體中文" if "簡" in lang_sel else "繁體中文"
+
+        work_dir = Path(self.cfg.get("output_dir", "output")) / safe_name(f"{t_input}_中文專案")
+        try:
+            create_project_from_text(
+                src_p,
+                work_dir,
+                title=t_input,
+                author=a_input,
+                language=target_lang,
+                split_pattern=pattern,
+                as_translated=True,
+                encoding=enc,
+                sort_chapters=do_sort,
+            )
+            out_epub = Path(self.cfg.get("output_dir", "output")) / f"{safe_name(t_input)}_中文.epub"
+            if not out_epub.exists():
+                import_text_to_epub(
+                    src_p,
+                    out_epub,
+                    title=t_input,
+                    author=a_input,
+                    language=target_lang,
+                    split_pattern=pattern,
+                    encoding=enc,
+                    sort_chapters=do_sort,
+                )
+
+            ans = messagebox.askyesno(
+                "中文專案建立成功",
+                f"中文專案已建立完成（已載入 {len(self.imported_chapters)} 章譯文）：\n{work_dir.resolve()}\n\n是否立即切換至「一致性檢查與局部重譯」進行術語合規審核？",
+            )
+            self.log_text.insert(tk.END, f"已建立中文專案：{work_dir.resolve()}\n")
+            if ans:
+                self.audit_proj_var.set(str(work_dir.resolve()))
+                self.notebook.select(self.tab_audit)
+                self._action_audit_compliance()
+        except Exception as exc:
+            messagebox.showerror("建立專案失敗", str(exc))
 
     def _action_import_create_project_only(self):
         if not hasattr(self, "imported_chapters") or not self.imported_chapters:
@@ -600,6 +791,8 @@ class TranslatorGUI(tk.Tk):
         t_input = self.import_title_var.get().strip() or src_p.stem
         a_input = self.import_author_var.get().strip() or "未知作者"
         pattern = self._get_import_regex()
+        enc = self._get_import_encoding()
+        do_sort = self.import_sort_var.get()
 
         work_dir = Path(self.cfg.get("output_dir", "output")) / safe_name(f"{t_input}_中文翻译")
         try:
@@ -609,10 +802,21 @@ class TranslatorGUI(tk.Tk):
                 title=t_input,
                 author=a_input,
                 split_pattern=pattern,
+                as_translated=False,
+                encoding=enc,
+                sort_chapters=do_sort,
             )
             out_epub = Path(self.cfg.get("output_dir", "output")) / f"{safe_name(t_input)}_日文原文.epub"
             if not out_epub.exists():
-                import_text_to_epub(src_p, out_epub, title=t_input, author=a_input, split_pattern=pattern)
+                import_text_to_epub(
+                    src_p,
+                    out_epub,
+                    title=t_input,
+                    author=a_input,
+                    split_pattern=pattern,
+                    encoding=enc,
+                    sort_chapters=do_sort,
+                )
             messagebox.showinfo("專案建立成功", f"翻譯專案已建立完成：\n{work_dir.resolve()}\n\n您可隨時切換至「本機 AI 翻譯」或「術語表管理」進行處理。")
             self.log_text.insert(tk.END, f"已建立翻譯專案：{work_dir.resolve()}\n")
         except Exception as exc:
@@ -629,6 +833,8 @@ class TranslatorGUI(tk.Tk):
         t_input = self.import_title_var.get().strip() or src_p.stem
         a_input = self.import_author_var.get().strip() or "未知作者"
         pattern = self._get_import_regex()
+        enc = self._get_import_encoding()
+        do_sort = self.import_sort_var.get()
 
         out_name = f"{safe_name(t_input)}_日文原文.epub"
         out_p = Path(self.cfg.get("output_dir", "output")) / out_name
@@ -641,6 +847,8 @@ class TranslatorGUI(tk.Tk):
                     title=t_input,
                     author=a_input,
                     split_pattern=pattern,
+                    encoding=enc,
+                    sort_chapters=do_sort,
                 )
             self.tr_epub_var.set(str(out_p.resolve()))
             self.notebook.select(self.tab_translate)

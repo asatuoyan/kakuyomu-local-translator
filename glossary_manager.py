@@ -161,16 +161,10 @@ def format_glossary_prompt(glossary: list[GlossaryEntry] | dict[str, Any]) -> st
 
 
 def import_from_csv(path: Path) -> list[GlossaryEntry]:
-    encodings = ["utf-8-sig", "utf-8", "cp932", "gbk", "big5"]
-    content = None
-    for enc in encodings:
-        try:
-            content = path.read_text(encoding=enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if content is None:
-        raise ValueError(f"無法讀取 CSV 檔案編碼：{path}")
+    from text_importer import read_text_file
+    content = read_text_file(path)
+    if not content:
+        return []
 
     lines = [line for line in csv.reader(content.splitlines()) if line and any(cell.strip() for cell in line)]
     if not lines:
