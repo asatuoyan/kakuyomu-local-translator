@@ -85,6 +85,8 @@ from main import (
 )
 from playwright.sync_api import sync_playwright
 from epub_append import build_extended_epub, create_project_from_epub, inspect_epub
+from languages import LANGUAGES, language_name
+from main import translate_epub_language
 
 
 # Based on the supplied color guide, with a softer, higher-contrast light theme.
@@ -267,7 +269,7 @@ class TranslatorGUI(tk.Tk):
 
         author_lbl = ttk.Label(
             top_frame,
-            text="下載或匯入原文，再用本機 AI 製作中文 EPUB。",
+            text="下載或匯入原文，再用本機 AI 製作多語言 EPUB。",
             style="Muted.TLabel",
         )
         author_lbl.pack(anchor=tk.W, pady=(3, 0))
@@ -1413,15 +1415,19 @@ class TranslatorGUI(tk.Tk):
         ttk.Button(src_frame, text="選擇 EPUB...", command=self._action_select_tr_epub).grid(row=0, column=2, padx=4, pady=4)
 
         # Target Language & Translation Mode
-        opt_frame = ttk.LabelFrame(f, text="2 · 設定中文用字與模式", padding=14)
+        opt_frame = ttk.LabelFrame(f, text="2 · 選擇輸出語言與模式", padding=14)
         opt_frame.pack(fill=tk.X, pady=(4, 8))
         language_row = ttk.Frame(opt_frame)
         language_row.pack(fill=tk.X, pady=(0, 12))
 
-        ttk.Label(language_row, text="輸出用字：").pack(side=tk.LEFT)
-        self.tr_lang_var = tk.StringVar(value="繁體中文")
-        ttk.Radiobutton(language_row, text="繁體中文", variable=self.tr_lang_var, value="繁體中文").pack(side=tk.LEFT, padx=8)
-        ttk.Radiobutton(language_row, text="簡體中文", variable=self.tr_lang_var, value="簡體中文").pack(side=tk.LEFT, padx=8)
+        self.tr_language_vars = {}
+        for index, (code, (label, _)) in enumerate(LANGUAGES.items()):
+            variable = tk.BooleanVar(value=code == "zh-Hant")
+            self.tr_language_vars[code] = variable
+            ttk.Checkbutton(language_row, text=label, variable=variable).grid(
+                row=index // 4, column=index % 4, sticky=tk.W, padx=(0, 18), pady=3)
+        ttk.Label(opt_frame, text="可多選，每種語言獨立輸出；中文標題與正文會自動統一簡繁。",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 8))
 
         self.tr_mode_var = tk.StringVar(value="custom")
         custom_model = self.cfg.get("custom_model", self.cfg.get("model", ""))
@@ -1470,7 +1476,10 @@ class TranslatorGUI(tk.Tk):
             return
 
         source = Path(epub_str)
-        lang = self.tr_lang_var.get()
+        languages = [code for code, variable in self.tr_language_vars.items() if variable.get()]
+        if not languages:
+            messagebox.showwarning("提示", "請至少選擇一種輸出語言。")
+            return
         mode_val = self.tr_mode_var.get()
 
         # Update model profile
@@ -1492,85 +1501,47 @@ class TranslatorGUI(tk.Tk):
             self.cfg["model"] = self.cfg.get("custom_model", self.cfg["model"])
             self.cfg["dual_stage"] = False
 
-        self.cfg["target_language"] = lang
+        task_cfg = dict(self.cfg)
+        task_cfg["_translation_cancelled"] = lambda: self.stop_requested
         self.stop_requested = False
         self._set_busy(True, f"正在開始翻譯《{source.stem}》……")
         self.btn_stop.config(state=tk.NORMAL)
 
         def _worker():
+            outputs = []
+            failures = []
             try:
-                ensure_model(self.cfg, interactive=False)
-                if self.cfg.get("dual_stage"):
-                    ensure_model(self.cfg, self.cfg["review_model"], interactive=False)
-
-                work_dir = Path(self.cfg["output_dir"]) / safe_name(source.stem + "_中文翻譯")
-                work_dir.mkdir(parents=True, exist_ok=True)
-                assets_dir = work_dir / "assets"
-
-                metadata, chapters = extract_epub_chapters(source, assets_dir)
-                eff_entries = get_effective_glossary(self.cfg, work_dir)
-                if not (work_dir / "glossary.json").exists() and eff_entries:
-                    save_project_glossary(work_dir, eff_entries)
-
-                ch_cfg = dict(self.cfg)
-                ch_cfg["target_language"] = lang
-                ch_cfg["glossary"] = entries_to_dict(eff_entries)
-                ch_cfg["_translation_cancelled"] = lambda: self.stop_requested
-
-                # Translate metadata
-                meta_values = [metadata.get("title", source.stem)]
-                if metadata.get("description"):
-                    meta_values.append(metadata["description"])
-                meta_episode = Episode(url="epub://metadata", work_title="", episode_title="作品資訊",
-                                       paragraphs=meta_values,
-                                       blocks=[{"type": "text", "text": v} for v in meta_values])
-                meta_draft = translate_episode(meta_episode, ch_cfg, work_dir)
-                meta_final = proofread_episode(meta_episode, meta_draft, ch_cfg, work_dir) if ch_cfg.get("dual_stage") else meta_draft
-                metadata["title"] = meta_final[0]
-                if len(meta_final) > 1:
-                    metadata["description"] = meta_final[1]
-
-                book = TranslationBook(source, work_dir, metadata, lang)
-                for idx, ch in enumerate(chapters, 1):
+                ensure_model(task_cfg, interactive=False)
+                if task_cfg.get("dual_stage"):
+                    ensure_model(task_cfg, task_cfg["review_model"], interactive=False)
+                for language_index, code in enumerate(languages):
                     if self.stop_requested:
-                        self.log_queue.put(("log", "使用者中止翻譯。\n"))
-                        break
+                        raise TranslationCancelled()
 
-                    pct = ((idx - 1) / len(chapters)) * 100
-                    self.log_queue.put(("progress", pct))
-                    self.log_queue.put(("log", f"[{idx}/{len(chapters)}] 翻譯中：{ch.title}\n"))
-                    if book.completed(idx, ch):
-                        self.log_queue.put(("log", "已接續上次完成的章節。\n"))
-                        for output in book.checkpoint(idx, len(chapters)):
-                            self.log_queue.put(("log", f"已儲存 EPUB：{output.name}\n"))
-                        continue
+                    def progress(percent, message):
+                        overall = (language_index * 100 + percent) / len(languages)
+                        self.log_queue.put(("progress", overall))
+                        self.log_queue.put(("status", message))
 
-                    ep = Episode(url=ch.url, work_title="", episode_title=ch.title,
-                                 paragraphs=ch.paragraphs, blocks=ch.blocks)
-                    title_ep = Episode(url=ch.url + "#title", work_title="", episode_title=ch.title,
-                                       paragraphs=[ch.title], blocks=[{"type": "text", "text": ch.title}])
-                    t_draft = translate_episode(title_ep, ch_cfg, work_dir)
-                    t_final = proofread_episode(title_ep, t_draft, ch_cfg, work_dir)[0] if ch_cfg.get("dual_stage") else t_draft[0]
-                    ep.episode_title = t_final
-
-                    drafts = translate_episode(ep, ch_cfg, work_dir)
-                    translations = proofread_episode(ep, drafts, ch_cfg, work_dir) if ch_cfg.get("dual_stage") else drafts
-
-                    translated_ch = _translated_chapter(ch, translations)
-                    translated_ch.title = t_final
-                    book.save(idx, ch, translated_ch)
-                    for output in book.checkpoint(idx, len(chapters)):
-                        self.log_queue.put(("log", f"已儲存 EPUB：{output.name}\n"))
-
-                if not self.stop_requested:
-                    out_epub = book.finish(len(chapters))
-                    self.log_queue.put(("progress", 100.0))
-                    self.log_queue.put(("translate_complete", str(out_epub)))
+                    try:
+                        output = translate_epub_language(source, task_cfg, code, progress)
+                        outputs.append(str(output))
+                        self.log_queue.put(("log", f"[{language_name(code)}] 已完成：{output}\n"))
+                    except TranslationCancelled:
+                        raise
+                    except Exception as exc:
+                        failures.append(f"{language_name(code)}：{exc}")
+                        self.log_queue.put(("log", f"[{language_name(code)}] 未完成：{exc}\n"))
+                if failures:
+                    summary = "\n".join(failures)
+                    if outputs:
+                        summary += "\n\n已成功輸出：\n" + "\n".join(outputs)
+                    self.log_queue.put(("error", summary))
                 else:
-                    self.log_queue.put(("log", "已儲存章節，可重新啟動後接續翻譯。\n"))
-                    self.log_queue.put(("translate_stopped", None))
+                    self.log_queue.put(("progress", 100.0))
+                    self.log_queue.put(("translate_complete", "\n".join(outputs)))
             except TranslationCancelled:
-                self.log_queue.put(("log", "已停止翻譯，保留已完成的快取，可重新開始接續。\n"))
+                self.log_queue.put(("log", "已停止翻譯，保留各語言已完成的進度，可重新開始接續。\n"))
                 self.log_queue.put(("translate_stopped", None))
             except Exception as exc:
                 self.log_queue.put(("error", f"翻譯失敗：{exc}"))
@@ -1795,6 +1766,8 @@ class TranslatorGUI(tk.Tk):
                     self.log_text.see(tk.END)
                 elif msg_type == "progress":
                     self.progress_var.set(payload)
+                elif msg_type == "status":
+                    self.status_var.set(payload)
                 elif msg_type == "error":
                     self._set_busy(False)
                     self.status_var.set("執行未完成 · 請查看日誌")
@@ -1821,8 +1794,8 @@ class TranslatorGUI(tk.Tk):
                     messagebox.showinfo("下載完成", f"日文原文 EPUB 已成功生成：\n{payload}")
                 elif msg_type == "translate_complete":
                     self._set_busy(False)
-                    self.log_text.insert(tk.END, f"中文 EPUB 翻譯完成：{payload}\n")
-                    messagebox.showinfo("翻譯完成", f"中文 EPUB 電子書已成功生成：\n{payload}")
+                    self.log_text.insert(tk.END, f"EPUB 翻譯完成：\n{payload}\n")
+                    messagebox.showinfo("翻譯完成", f"各語言 EPUB 已成功生成：\n{payload}")
                 elif msg_type == "translate_stopped":
                     self._set_busy(False)
                 elif msg_type == "candidates_ready":

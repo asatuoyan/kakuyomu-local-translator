@@ -586,6 +586,19 @@ def extract_epub_chapters(source: Path, assets_dir: Path) -> tuple[dict[str, Any
 
 def translated_source_epub(metadata: dict[str, Any], chapters: list[SourceChapter], output: Path,
                            language: str) -> Path:
+    from languages import language_code, normalize_output
+    from dataclasses import replace
+
+    # Normalize at export as well, including chapters restored from older caches.
+    metadata = dict(metadata)
+    for key in ("title", "description"):
+        if metadata.get(key):
+            metadata[key] = normalize_output(metadata[key], language)
+    chapters = [replace(chapter, title=normalize_output(chapter.title, language),
+                        paragraphs=[normalize_output(text, language) for text in chapter.paragraphs],
+                        blocks=[{**block, **{key: normalize_output(block[key], language)
+                                             for key in ("text", "alt") if key in block}}
+                                for block in chapter.blocks]) for chapter in chapters]
     work = WorkInfo(url="local-epub:" + output.stem, title=metadata["title"],
                     author=metadata.get("author", ""), description=metadata.get("description", ""),
                     cover_url="", episodes=[])
@@ -598,4 +611,4 @@ def translated_source_epub(metadata: dict[str, Any], chapters: list[SourceChapte
     if metadata.get("cover_path") and Path(metadata["cover_path"]).exists():
         cover = (Path(metadata["cover_path"]).read_bytes(), metadata.get("cover_media_type", "image/jpeg"))
     return build_source_epub(work, chapters, output, cover=cover,
-                             language="zh-Hant" if "繁" in language else "zh-Hans")
+                             language=language_code(language))

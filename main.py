@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from languages import LANGUAGES, language_code, language_name, language_suffix, normalize_output, output_glossary
 import random
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
@@ -404,8 +405,8 @@ def translate_chunk(
     system = f"""你是專業日文小說譯者。把輸入翻譯成{cfg['target_language']}。
 規則：
 1. 保留敘事語氣、角色口吻、段落數及順序，不增刪、摘要或審查內容。
-2. 固有名詞保持一致；不確定的日文人名優先保留漢字。
-3. 日文引號「」在中文中仍用「」；擬聲詞依語境自然翻譯。
+2. 固有名詞保持一致，依目標語言的慣例翻譯或音譯。
+3. 引號、標點與擬聲詞使用目標語言的自然表達。
 4. 只回傳 JSON，格式為 {{"translations":["第一段", "第二段"]}}。
 5. translations 的元素數量必須與輸入段落完全相同。
 
@@ -460,7 +461,7 @@ def translate_chunk(
         raise RuntimeError(
             f"模型回傳 {returned_count} 段，但預期 1 段。"
         )
-    return [normalize_text(str(x)) for x in translations]
+    return [normalize_output(normalize_text(str(x)), cfg["target_language"]) for x in translations]
 
 
 def make_batches(
@@ -583,7 +584,7 @@ def translate_episode(episode: Episode, cfg: dict[str, Any], work_dir: Path) -> 
         print("本章已命中本機翻譯快取。")
     if cfg.get("check_glossary", True):
         translated = report_and_check_compliance(episode, translated, cfg, label="初譯")
-    return translated
+    return [normalize_output(value, cfg["target_language"]) for value in translated]
 
 
 def make_review_batches(
@@ -613,10 +614,10 @@ def review_chunk(
         for index, (original, draft) in enumerate(pairs, 1)
     )
     context_chars = int(cfg.get("review_context_chars", 2600))
-    system = f"""你是日中小说译文的资深校对编辑。目标语言是{cfg['target_language']}。
+    system = f"""你是多语言小说译文的资深校对编辑。目标语言是{cfg['target_language']}。
 请对照日文原文校订初译，而不是脱离原文重写。
 规则：
-1. 修正误译、漏译、代词指向、人物口吻、时态、语气和不自然中文。
+1. 修正误译、漏译、代词指向、人物口吻、时态、语气和不自然的目标语言表达。
 2. 保持信息完整，不添加原文没有的解释，不删减敏感或困难内容。
 3. 固有名词严格遵守术语表，并与前文终稿一致。
 4. 保持段落数量和顺序不变。
@@ -661,7 +662,7 @@ def review_chunk(
             f"校对模型返回 {len(translations) if isinstance(translations, list) else 0} 段，"
             f"但预期 {len(pairs)} 段。"
         )
-    return [normalize_text(str(value)) for value in translations]
+    return [normalize_output(normalize_text(str(value)), cfg["target_language"]) for value in translations]
 
 
 def proofread_episode(
@@ -711,7 +712,7 @@ def proofread_episode(
         print("本章已命中14B校对缓存。")
     if cfg.get("check_glossary", True):
         final = report_and_check_compliance(episode, final, cfg, label="14B校對")
-    return final
+    return [normalize_output(value, cfg["target_language"]) for value in final]
 
 
 def add_or_update_project(
@@ -1131,12 +1132,15 @@ class TranslationBook:
         self.path = work_dir / "translation-project.json"
         source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
         saved = load_json(self.path, {})
-        if saved and (saved.get("source_hash"), saved.get("language")) != (source_hash, language):
+        if saved and (saved.get("source_hash"), language_code(saved.get("language", ""))) != (source_hash, language_code(language)):
             raise ValueError("翻譯專案的原文或目標語言已變更，請使用另一個輸出資料夾。")
         self.state = saved or {"source_hash": source_hash, "language": language,
                                "metadata": metadata, "chapters": []}
         self.metadata = self.state["metadata"]
-        self.output = work_dir / f"{safe_name(self.metadata['title'])}_{'繁中' if '繁' in language else '简中'}.epub"
+        for key in ("title", "description"):
+            if self.metadata.get(key):
+                self.metadata[key] = normalize_output(self.metadata[key], language)
+        self.output = work_dir / f"{safe_name(self.metadata['title'])}_{language_suffix(language)}.epub"
 
     def completed(self, index: int, chapter: SourceChapter) -> bool:
         records = self.state["chapters"]
@@ -1196,6 +1200,81 @@ class TranslationBook:
         return output
 
 
+def translation_work_dir(source: Path, cfg: dict[str, Any], language: str) -> Path:
+    """Reuse matching legacy projects, otherwise isolate each output language."""
+    code = language_code(language)
+    root = Path(cfg["output_dir"])
+    for ending in ("_中文翻譯", "_中文翻译"):
+        legacy = root / safe_name(source.stem + ending)
+        saved = load_json(legacy / "translation-project.json", {})
+        if saved and language_code(saved.get("language", "")) == code and (
+            saved.get("source_hash") == hashlib.sha256(source.read_bytes()).hexdigest()
+        ):
+            return legacy
+    return root / safe_name(source.stem + "_翻譯") / code
+
+
+def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
+                            progress=None) -> Path:
+    """One resumable language job, shared by the GUI and command line."""
+    language = language_name(language)
+    normalize_output("", language)  # Check the converter before doing model work.
+    work_dir = translation_work_dir(source, cfg, language)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    metadata, chapters = extract_epub_chapters(source, work_dir / "assets")
+    chapter_cfg = dict(cfg)
+    chapter_cfg["target_language"] = language
+    chapter_cfg["glossary"] = output_glossary(cfg, language)
+    entries = get_effective_glossary(chapter_cfg, work_dir)
+    chapter_cfg["glossary"] = entries_to_dict(entries)
+    if entries and not (work_dir / "glossary.json").exists():
+        save_project_glossary(work_dir, entries)
+    chapter_cfg["glossary"] = output_glossary(
+        {"glossary_by_language": {language_code(language): chapter_cfg["glossary"]}}, language
+    )
+    cancelled = cfg.get("_translation_cancelled", lambda: False)
+
+    def check_cancelled():
+        if cancelled():
+            raise TranslationCancelled()
+
+    def translate(ep):
+        check_cancelled()
+        drafts = translate_episode(ep, chapter_cfg, work_dir)
+        return proofread_episode(ep, drafts, chapter_cfg, work_dir) if cfg.get("dual_stage") else drafts
+
+    values = [metadata.get("title", source.stem)]
+    if metadata.get("description"):
+        values.append(metadata["description"])
+    final = translate(Episode(url="epub://metadata", work_title="", episode_title="作品資訊",
+                              paragraphs=values, blocks=[{"type": "text", "text": v} for v in values]))
+    metadata["title"] = final[0]
+    if len(final) > 1:
+        metadata["description"] = final[1]
+    book = TranslationBook(source, work_dir, metadata, language)
+    for index, chapter in enumerate(chapters, 1):
+        check_cancelled()
+        if progress:
+            progress((index - 1) / len(chapters) * 100, f"{language} · {index}/{len(chapters)} · {chapter.title}")
+        print(f"[{language} {index}/{len(chapters)}] {chapter.title}", flush=True)
+        if not book.completed(index, chapter):
+            title_ep = Episode(url=chapter.url + "#title", work_title="", episode_title=chapter.title,
+                               paragraphs=[chapter.title], blocks=[{"type": "text", "text": chapter.title}])
+            title = translate(title_ep)[0]
+            episode = _episode_from_source(chapter)
+            episode.episode_title = title
+            translated = _translated_chapter(chapter, translate(episode))
+            translated.title = title
+            book.save(index, chapter, translated)
+        for output in book.checkpoint(index, len(chapters)):
+            print(f"已儲存 EPUB：{output}", flush=True)
+    check_cancelled()
+    output = book.finish(len(chapters))
+    if progress:
+        progress(100.0, f"{language} · 已完成")
+    return output
+
+
 def translate_source_epub(
     cfg: dict[str, Any],
     append_to_existing: bool,
@@ -1207,19 +1286,25 @@ def translate_source_epub(
         source = select_epub_file("选择需要翻译的日文 EPUB")
     if not source.exists() or source.suffix.lower() != ".epub":
         raise ValueError("找不到有效的日文 EPUB。")
-    if append_to_existing:
-        work_dir = import_epub(cfg)
-        if not work_dir:
-            return
-        project = load_json(work_dir / "project.json", {})
-        language = project.get("language", cfg["target_language"])
-        assets_dir = work_dir / "assets"
-    else:
-        language_choice = input("输出中文：1. 简体中文  2. 繁體中文 [2]：").strip()
-        language = "简体中文" if language_choice == "1" else "繁體中文"
-        work_dir = Path(cfg["output_dir"]) / safe_name(source.stem + "_中文翻译")
-        work_dir.mkdir(parents=True, exist_ok=True)
-        assets_dir = work_dir / "assets"
+    if not append_to_existing:
+        choices = list(LANGUAGES)
+        print("\n輸出語言（可用逗號多選，各自產生 EPUB）：")
+        for index, code in enumerate(choices, 1):
+            print(f"  {index}. {language_name(code)}")
+        selected = input("請選擇 [1]：").strip() or "1"
+        indices = list(dict.fromkeys(re.split(r"[,，\s]+", selected)))
+        if any(not item.isdigit() or not 1 <= int(item) <= len(choices) for item in indices):
+            raise ValueError("請輸入有效的語言編號。")
+        for item in indices:
+            output = translate_epub_language(source, cfg, choices[int(item) - 1])
+            print(f"已完成：{output}")
+        return
+    work_dir = import_epub(cfg)
+    if not work_dir:
+        return
+    project = load_json(work_dir / "project.json", {})
+    language = project.get("language", cfg["target_language"])
+    assets_dir = work_dir / "assets"
     metadata, chapters = extract_epub_chapters(source, assets_dir)
     effective_entries = get_effective_glossary(cfg, work_dir)
     if not (work_dir / "glossary.json").exists() and effective_entries:
@@ -1948,7 +2033,7 @@ def main() -> int:
     print("\n================ Kakuyomu / Syosetu 翻譯工具 ================")
     print("选择工作：")
     print("  1. Kakuyomu / 小說家になろう → 日文原文 EPUB（选择起止章节）")
-    print("  2. 日文 EPUB → 独立中文 EPUB")
+    print("  2. 日文 EPUB → 多語言 EPUB（可多選）")
     print("  3. 日文 EPUB → 追加到已有中文 EPUB")
     print("  4. 导入已有中文 EPUB，再手动打开网页逐章续接")
     print("  5. 继续上次的网页续接项目")

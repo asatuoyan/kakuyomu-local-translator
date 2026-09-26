@@ -19,6 +19,7 @@
   "request_timeout_seconds": 600,
   "request_delay_seconds": 8.0,
   "temperature": 0.2,
+  "glossary_by_language": {},
   "glossary": {
     "例：固有人名": "例：固定譯名"
   }
