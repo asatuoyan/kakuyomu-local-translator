@@ -66,6 +66,9 @@ from main import (
     CONFIG_PATH,
     APP_DIR,
     Episode,
+    TranslationBook,
+    TranslationCancelled,
+    _translated_chapter,
     _choose_browser,
     _launch_context,
     _select_range,
@@ -82,6 +85,33 @@ from main import (
 )
 from playwright.sync_api import sync_playwright
 from epub_append import build_extended_epub, create_project_from_epub, inspect_epub
+
+
+# Based on the supplied color guide, with a softer, higher-contrast light theme.
+UI_PALETTES = {
+    "light": {
+        "background": "#DDE3EB", "surface": "#EDF1F6", "container": "#CBD5E2",
+        "line": "#B6C1D0", "border": "#9CAABD", "text": "#151A29",
+        "secondary": "#253247", "muted": "#39485E", "subtle": "#526179",
+        "disabled": "#64748B", "accent": "#456AFF", "hover_source": "#1E253C",
+        "hover_alpha": 0.05,
+    },
+    "dark": {
+        "background": "#101010", "surface": "#1F2024", "container": "#2E2E31",
+        "line": "#3A3B40", "border": "#414248", "text": "#EDEFF2",
+        "secondary": "#D5D6DA", "muted": "#C8C8CC", "subtle": "#7D7E80",
+        "disabled": "#AAADB5", "accent": "#456AFF", "hover_source": "#FFFFFF",
+        "hover_alpha": 0.10,
+    },
+}
+
+
+def blend_color(foreground: str, background: str, alpha: float) -> str:
+    """Flatten the guide's translucent hover color for opaque Tk widgets."""
+    return "#" + "".join(
+        f"{round(int(foreground[i:i + 2], 16) * alpha + int(background[i:i + 2], 16) * (1 - alpha)):02X}"
+        for i in (1, 3, 5)
+    )
 
 
 class TextRedirector:
@@ -109,6 +139,7 @@ class TranslatorGUI(tk.Tk):
         self.log_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.active_thread: threading.Thread | None = None
         self.stop_requested = False
+        self.ui_theme = "light"
 
         # Apply ttk style
         self.style = ttk.Style(self)
@@ -116,33 +147,134 @@ class TranslatorGUI(tk.Tk):
             self.style.theme_use("clam")
         except Exception:
             pass
+        self._configure_styles()
 
         self._init_ui()
         self._poll_queue()
 
+    def _configure_styles(self):
+        p = UI_PALETTES[self.ui_theme]
+        self.palette = p
+        hover = blend_color(p["hover_source"], p["surface"], p["hover_alpha"])
+        accent_hover = blend_color(p["hover_source"], p["accent"], p["hover_alpha"])
+        self.configure(background=p["background"])
+        self.option_add("*Font", ("Microsoft JhengHei UI", 11))
+        for widget in ("Listbox", "Text", "Menu"):
+            self.option_add(f"*{widget}.background", p["surface"])
+            self.option_add(f"*{widget}.foreground", p["text"])
+        self.option_add("*Listbox.selectBackground", p["accent"])
+        self.option_add("*Listbox.selectForeground", "#FFFFFF")
+        self.option_add("*Text.selectBackground", p["accent"])
+        self.option_add("*Text.selectForeground", "#FFFFFF")
+        self.option_add("*Text.insertBackground", p["text"])
+        self.option_add("*Menu.activeBackground", hover)
+        self.option_add("*Menu.activeForeground", p["text"])
+        self.option_add("*Menu.disabledForeground", p["disabled"])
+        self.option_add("*Toplevel.background", p["background"])
+        self.option_add("*TCombobox*Listbox.background", p["surface"])
+        self.option_add("*TCombobox*Listbox.foreground", p["text"])
+        self.style.configure(".", font=("Microsoft JhengHei UI", 11),
+                             background=p["background"], foreground=p["text"],
+                             bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
+                             troughcolor=p["surface"], focuscolor=p["accent"], selectbackground=p["accent"],
+                             selectforeground="#FFFFFF")
+        self.style.map(".", foreground=[("disabled", p["disabled"])])
+        for name in ("TButton", "TMenubutton"):
+            self.style.configure(name, padding=(10, 6), background=p["surface"])
+            self.style.map(name, background=[("disabled", p["surface"]), ("pressed", hover), ("active", hover)],
+                           foreground=[("disabled", p["disabled"]), ("!disabled", p["text"])])
+        self.style.configure("TEntry", padding=5, fieldbackground=p["surface"], insertcolor=p["text"])
+        self.style.configure("TCombobox", padding=4, fieldbackground=p["surface"],
+                             background=p["surface"], arrowcolor=p["muted"])
+        self.style.map("TCombobox", fieldbackground=[("readonly", p["surface"])],
+                       foreground=[("disabled", p["disabled"]), ("readonly", p["text"])],
+                       background=[("active", hover)])
+        for name in ("TRadiobutton", "TCheckbutton"):
+            self.style.configure(name, indicatorbackground=p["surface"], indicatorforeground=p["text"])
+            self.style.map(name, background=[("active", p["background"])],
+                           indicatorbackground=[("disabled", p["surface"]), ("selected", p["accent"])],
+                           indicatorforeground=[("selected", "#FFFFFF")])
+        self.style.configure("TLabelframe", bordercolor=p["border"], borderwidth=1, relief="solid")
+        self.style.configure("TLabelframe.Label", foreground=p["secondary"],
+                             font=("Microsoft JhengHei UI", 11, "bold"))
+        self.style.configure("Muted.TLabel", foreground=p["muted"])
+        self.style.configure("Title.TLabel", font=("Microsoft JhengHei UI", 20, "bold"))
+        self.style.configure("Accent.TButton", background=p["accent"], foreground="#FFFFFF")
+        self.style.map("Accent.TButton",
+                       background=[("disabled", p["container"]), ("pressed", accent_hover), ("active", accent_hover)],
+                       foreground=[("disabled", p["disabled"]), ("!disabled", "#FFFFFF")])
+        self.style.configure("TNotebook", borderwidth=0)
+        self.style.configure("TNotebook.Tab", padding=(16, 9), background=p["container"],
+                             foreground=p["secondary"], font=("Microsoft JhengHei UI", 11, "bold"))
+        self.style.map("TNotebook.Tab", background=[("selected", p["accent"]), ("active", hover)],
+                       foreground=[("selected", "#FFFFFF")])
+        self.style.configure("Treeview", rowheight=33, background=p["surface"], fieldbackground=p["surface"],
+                             foreground=p["text"])
+        self.style.configure("Treeview.Heading", padding=(6, 7), background=p["container"], foreground=p["secondary"],
+                             font=("Microsoft JhengHei UI", 11, "bold"))
+        self.style.map("Treeview.Heading", background=[("active", hover)])
+        self.style.map("Treeview", background=[("selected", p["accent"])],
+                       foreground=[("selected", "#FFFFFF")])
+        self.style.configure("Horizontal.TProgressbar", background=p["accent"], troughcolor=p["surface"],
+                             lightcolor=p["accent"], darkcolor=p["accent"])
+        self.style.configure("TSeparator", background=p["line"])
+        for name in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            self.style.configure(name, background=p["container"], arrowcolor=p["muted"])
+            self.style.map(name, background=[("active", hover), ("pressed", hover)])
+        self._recolor_widgets(self, hover)
+
+    def _recolor_widgets(self, parent, hover):
+        p = self.palette
+        for widget in parent.winfo_children():
+            if isinstance(widget, (tk.Text, tk.Listbox)):
+                widget.configure(background=p["surface"], foreground=p["text"],
+                                 selectbackground=p["accent"], selectforeground="#FFFFFF",
+                                 highlightbackground=p["border"], highlightcolor=p["accent"])
+                if isinstance(widget, tk.Text):
+                    widget.configure(insertbackground=p["text"])
+            elif isinstance(widget, tk.Menu):
+                widget.configure(background=p["surface"], foreground=p["text"],
+                                 activebackground=hover, activeforeground=p["text"], disabledforeground=p["disabled"])
+            elif isinstance(widget, tk.Toplevel):
+                widget.configure(background=p["background"])
+            elif isinstance(widget, ttk.Combobox):
+                # A previously opened dropdown keeps its own classic Tk colors.
+                popup_list = f"{widget}.popdown.f.l"
+                if int(self.tk.call("winfo", "exists", popup_list)):
+                    self.tk.call(popup_list, "configure", "-background", p["surface"],
+                                 "-foreground", p["text"], "-selectbackground", p["accent"],
+                                 "-selectforeground", "#FFFFFF")
+            self._recolor_widgets(widget, hover)
+
+    def _toggle_theme(self):
+        self.ui_theme = "dark" if self.ui_theme == "light" else "light"
+        self._configure_styles()
+        self.theme_button.configure(text="淺色模式" if self.ui_theme == "dark" else "深色模式")
+
     def _init_ui(self):
         # Top banner
-        top_frame = ttk.Frame(self, padding=(12, 8))
+        top_frame = ttk.Frame(self, padding=(20, 14))
         top_frame.pack(side=tk.TOP, fill=tk.X)
+        self.theme_button = ttk.Button(top_frame, text="深色模式", command=self._toggle_theme)
+        self.theme_button.pack(side=tk.RIGHT)
 
         title_lbl = ttk.Label(
             top_frame,
-            text="小說下載與本機 AI 翻譯工具",
-            font=("Microsoft JhengHei UI", 15, "bold"),
+            text="小說翻譯工作室",
+            style="Title.TLabel",
         )
-        title_lbl.pack(side=tk.LEFT)
+        title_lbl.pack(anchor=tk.W)
 
         author_lbl = ttk.Label(
             top_frame,
-            text="支援 Kakuyomu 與 小說家になろう | 本地 Ollama 隱私翻譯",
-            font=("Microsoft JhengHei UI", 9),
-            foreground="#666666",
+            text="下載或匯入原文，再用本機 AI 製作中文 EPUB。",
+            style="Muted.TLabel",
         )
-        author_lbl.pack(side=tk.LEFT, padx=12, pady=(4, 0))
+        author_lbl.pack(anchor=tk.W, pady=(3, 0))
 
         # Main Notebook Tabs
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=(4, 12))
 
         self.tab_download = ttk.Frame(self.notebook, padding=10)
         self.tab_import = ttk.Frame(self.notebook, padding=10)
@@ -150,11 +282,11 @@ class TranslatorGUI(tk.Tk):
         self.tab_translate = ttk.Frame(self.notebook, padding=10)
         self.tab_audit = ttk.Frame(self.notebook, padding=10)
 
-        self.notebook.add(self.tab_download, text=" 1. 小說下載 (EPUB) ")
-        self.notebook.add(self.tab_import, text=" 2. TXT/MD 批次導入 ")
-        self.notebook.add(self.tab_glossary, text=" 3. 術語表管理 ")
-        self.notebook.add(self.tab_translate, text=" 4. 本機 AI 翻譯 ")
-        self.notebook.add(self.tab_audit, text=" 5. 一致性檢查與局部重譯 ")
+        self.notebook.add(self.tab_download, text="下載小說")
+        self.notebook.add(self.tab_import, text="匯入檔案")
+        self.notebook.add(self.tab_translate, text="翻譯 EPUB")
+        self.notebook.add(self.tab_glossary, text="術語表")
+        self.notebook.add(self.tab_audit, text="檢查與重譯")
 
         self._setup_tab_download()
         self._setup_tab_import()
@@ -163,22 +295,37 @@ class TranslatorGUI(tk.Tk):
         self._setup_tab_audit()
 
         # Bottom Global Log / Status Bar
-        bot_frame = ttk.LabelFrame(self, text="即時執行日誌與狀態", padding=6)
-        bot_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=False, padx=12, pady=(0, 8))
+        footer = ttk.Frame(self, padding=(20, 0, 20, 12))
+        footer.pack(side=tk.BOTTOM, fill=tk.X, before=self.notebook)
+        status_row = ttk.Frame(footer)
+        status_row.pack(fill=tk.X)
+        self.status_var = tk.StringVar(value="就緒")
+        self.status_bar = ttk.Label(status_row, textvariable=self.status_var, anchor=tk.W)
+        self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.log_toggle = ttk.Button(status_row, text="顯示日誌", command=self._toggle_log)
+        self.log_toggle.pack(side=tk.RIGHT)
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_bar = ttk.Progressbar(footer, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=(8, 0))
+        self.log_panel = ttk.Frame(footer, padding=(0, 8, 0, 0))
+        bot_frame = self.log_panel
 
-        self.log_text = tk.Text(bot_frame, height=7, wrap=tk.WORD, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        self.log_text = tk.Text(bot_frame, height=5, wrap=tk.WORD, font=("Microsoft JhengHei UI", 11),
+                                bg=self.palette["surface"], fg=self.palette["secondary"],
+                                relief=tk.FLAT, padx=10, pady=8)
         log_scroll = ttk.Scrollbar(bot_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress_bar = ttk.Progressbar(self, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 4))
-
-        self.status_var = tk.StringVar(value="就緒")
-        self.status_bar = ttk.Label(self, textvariable=self.status_var, font=("Microsoft JhengHei UI", 9), relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 2))
+    def _toggle_log(self):
+        if self.log_panel.winfo_manager():
+            self.log_panel.pack_forget()
+            self.log_toggle.configure(text="顯示日誌")
+        else:
+            self.log_panel.pack(fill=tk.X)
+            self.log_toggle.configure(text="收合日誌")
+            self.log_text.see(tk.END)
 
     # ==========================================
     # Tab 1: Download Novel
@@ -187,10 +334,10 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_download
 
         # URL Frame
-        url_frame = ttk.LabelFrame(f, text="作品網址與瀏覽器設定", padding=10)
+        url_frame = ttk.LabelFrame(f, text="1 · 貼上作品網址", padding=10)
         url_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(url_frame, text="小說網址：", font=("Microsoft JhengHei UI", 9, "bold")).grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(url_frame, text="小說網址：", font=("Microsoft JhengHei UI", 11, "bold")).grid(row=0, column=0, sticky=tk.W, pady=4)
         self.dl_url_var = tk.StringVar(value="https://ncode.syosetu.com/n2027ci/")
         url_entry = ttk.Entry(url_frame, textvariable=self.dl_url_var, width=65)
         url_entry.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
@@ -200,7 +347,7 @@ class TranslatorGUI(tk.Tk):
         btn_fetch_toc.grid(row=0, column=2, padx=4, pady=4)
 
         # Work info display
-        info_frame = ttk.LabelFrame(f, text="作品資訊與章節範圍", padding=10)
+        info_frame = ttk.LabelFrame(f, text="2 · 選擇下載範圍", padding=10)
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         self.dl_info_lbl = ttk.Label(info_frame, text="尚未讀取作品目錄。請輸入作品網址後點選「讀取作品目錄」。", wraplength=800)
@@ -221,7 +368,7 @@ class TranslatorGUI(tk.Tk):
         ttk.Label(range_frame, text="章（含起止章）").pack(side=tk.LEFT)
 
         # Chapter Listbox preview
-        self.dl_toc_listbox = tk.Listbox(info_frame, height=10, selectmode=tk.EXTENDED, font=("Microsoft JhengHei UI", 9))
+        self.dl_toc_listbox = tk.Listbox(info_frame, height=10, selectmode=tk.EXTENDED, font=("Microsoft JhengHei UI", 11))
         toc_scroll = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.dl_toc_listbox.yview)
         self.dl_toc_listbox.configure(yscrollcommand=toc_scroll.set)
         toc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -231,7 +378,7 @@ class TranslatorGUI(tk.Tk):
         btn_box = ttk.Frame(f)
         btn_box.pack(fill=tk.X, pady=4)
 
-        self.btn_start_dl = ttk.Button(btn_box, text=" 開始下載日文原文 EPUB ", command=self._action_start_download)
+        self.btn_start_dl = ttk.Button(btn_box, text="下載 EPUB", style="Accent.TButton", command=self._action_start_download)
         self.btn_start_dl.pack(side=tk.RIGHT, padx=4)
 
         self.current_work: WorkInfo | None = None
@@ -392,7 +539,7 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_import
 
         # Source Selection Frame
-        src_frame = ttk.LabelFrame(f, text="導入來源（單一全本 TXT / MD / UMD / JAR 檔案 或 多話章節資料夾）", padding=10)
+        src_frame = ttk.LabelFrame(f, text="匯入文字或電子書 · TXT / MD / UMD / JAR", padding=10)
         src_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(src_frame, text="檔案/資料夾：").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -514,7 +661,7 @@ class TranslatorGUI(tk.Tk):
         self.import_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.import_status_lbl = ttk.Label(f, text="請選擇檔案或資料夾後點選「預覽解析章節」。", foreground="#555555")
+        self.import_status_lbl = ttk.Label(f, text="請選擇檔案或資料夾後點選「預覽解析章節」。", style="Muted.TLabel")
         self.import_status_lbl.pack(fill=tk.X, pady=(2, 4))
 
         # Action Buttons
@@ -897,7 +1044,7 @@ class TranslatorGUI(tk.Tk):
         btn_choose_proj = ttk.Button(top_bar, text="選擇作品資料夾...", command=self._action_select_glossary_project)
         btn_choose_proj.pack(side=tk.LEFT, padx=6)
 
-        self.lbl_active_glossary_path = ttk.Label(top_bar, text="全域 config.json", foreground="#555555")
+        self.lbl_active_glossary_path = ttk.Label(top_bar, text="全域 config.json", style="Muted.TLabel")
         self.lbl_active_glossary_path.pack(side=tk.LEFT, padx=8)
 
         # Search & Filter
@@ -1183,7 +1330,7 @@ class TranslatorGUI(tk.Tk):
                 texts = []
                 for ch in chapters:
                     texts.extend(ch.paragraphs)
-                ensure_model(self.cfg)
+                ensure_model(self.cfg, interactive=False)
                 entries = scan_novel_entities(texts, self.cfg)
                 self.log_queue.put(("ai_entities_ready", entries))
             except Exception as exc:
@@ -1252,7 +1399,9 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_translate
 
         # Source Selection
-        src_frame = ttk.LabelFrame(f, text="日文原文來源與模式設定", padding=10)
+        ttk.Label(f, text="選擇原文與翻譯模式，即可開始。已完成的進度會自動接續。",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 12))
+        src_frame = ttk.LabelFrame(f, text="1 · 選擇日文 EPUB", padding=14)
         src_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(src_frame, text="日文 EPUB 檔案：").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -1264,30 +1413,39 @@ class TranslatorGUI(tk.Tk):
         ttk.Button(src_frame, text="選擇 EPUB...", command=self._action_select_tr_epub).grid(row=0, column=2, padx=4, pady=4)
 
         # Target Language & Translation Mode
-        opt_frame = ttk.Frame(src_frame)
-        opt_frame.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=6)
+        opt_frame = ttk.LabelFrame(f, text="2 · 設定中文用字與模式", padding=14)
+        opt_frame.pack(fill=tk.X, pady=(4, 8))
+        language_row = ttk.Frame(opt_frame)
+        language_row.pack(fill=tk.X, pady=(0, 12))
 
-        ttk.Label(opt_frame, text="輸出用字：").pack(side=tk.LEFT)
+        ttk.Label(language_row, text="輸出用字：").pack(side=tk.LEFT)
         self.tr_lang_var = tk.StringVar(value="繁體中文")
-        ttk.Radiobutton(opt_frame, text="繁體中文", variable=self.tr_lang_var, value="繁體中文").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(opt_frame, text="簡體中文", variable=self.tr_lang_var, value="簡體中文").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(language_row, text="繁體中文", variable=self.tr_lang_var, value="繁體中文").pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(language_row, text="簡體中文", variable=self.tr_lang_var, value="簡體中文").pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(opt_frame, text="翻譯模式：").pack(side=tk.LEFT, padx=(20, 0))
-        self.tr_mode_var = tk.StringVar(value="quality")
-        ttk.Radiobutton(opt_frame, text="快速 (8B)", variable=self.tr_mode_var, value="fast").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(opt_frame, text="質量 (14B)", variable=self.tr_mode_var, value="quality").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(opt_frame, text="混合模式 (8B初譯+14B校對)", variable=self.tr_mode_var, value="hybrid").pack(side=tk.LEFT, padx=4)
-
-        # Append to existing
-        self.tr_append_var = tk.BooleanVar(value=False)
-        cb_append = ttk.Checkbutton(src_frame, text="追加到已有中文 EPUB 母版（保留原有排版/插圖）", variable=self.tr_append_var)
-        cb_append.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=4)
+        self.tr_mode_var = tk.StringVar(value="custom")
+        custom_model = self.cfg.get("custom_model", self.cfg.get("model", ""))
+        modes = ttk.Frame(opt_frame)
+        modes.pack(fill=tk.X)
+        modes.columnconfigure(1, weight=1)
+        for row, (value, title, description) in enumerate([
+            ("custom", "自訂模型", custom_model or "使用設定檔中的模型"),
+            ("fast", "快速", "Qwen3 8B · 適合優先追求速度"),
+            ("quality", "品質", "Qwen3 14B · 翻譯較慢，記憶體需求較高"),
+            ("hybrid", "翻譯＋校對", "8B 初譯，再由 14B 校對"),
+        ]):
+            ttk.Radiobutton(modes, text=title, variable=self.tr_mode_var, value=value).grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 20), pady=7)
+            description_label = ttk.Label(modes, text=description, style="Muted.TLabel", wraplength=550)
+            description_label.grid(row=row, column=1, sticky=tk.EW, pady=7)
+            description_label.bind("<Configure>", lambda event: event.widget.configure(
+                wraplength=max(100, event.width)))
 
         # Progress / action buttons
         btn_box = ttk.Frame(f)
         btn_box.pack(fill=tk.X, pady=6)
 
-        self.btn_start_tr = ttk.Button(btn_box, text=" 開始本機 AI 翻譯 ", command=self._action_start_translate)
+        self.btn_start_tr = ttk.Button(btn_box, text="開始翻譯", style="Accent.TButton", command=self._action_start_translate)
         self.btn_start_tr.pack(side=tk.RIGHT, padx=4)
 
         self.btn_stop = ttk.Button(btn_box, text=" 中止 ", command=self._action_stop, state=tk.DISABLED)
@@ -1324,11 +1482,15 @@ class TranslatorGUI(tk.Tk):
             self.cfg["profile"] = "質量"
             self.cfg["model"] = "qwen3:14b"
             self.cfg["dual_stage"] = False
-        else:
+        elif mode_val == "hybrid":
             self.cfg["profile"] = "混合"
             self.cfg["model"] = "qwen3:8b"
             self.cfg["review_model"] = "qwen3:14b"
             self.cfg["dual_stage"] = True
+        else:
+            self.cfg["profile"] = "自訂"
+            self.cfg["model"] = self.cfg.get("custom_model", self.cfg["model"])
+            self.cfg["dual_stage"] = False
 
         self.cfg["target_language"] = lang
         self.stop_requested = False
@@ -1337,9 +1499,9 @@ class TranslatorGUI(tk.Tk):
 
         def _worker():
             try:
-                ensure_model(self.cfg)
+                ensure_model(self.cfg, interactive=False)
                 if self.cfg.get("dual_stage"):
-                    ensure_model(self.cfg, self.cfg["review_model"])
+                    ensure_model(self.cfg, self.cfg["review_model"], interactive=False)
 
                 work_dir = Path(self.cfg["output_dir"]) / safe_name(source.stem + "_中文翻譯")
                 work_dir.mkdir(parents=True, exist_ok=True)
@@ -1353,6 +1515,7 @@ class TranslatorGUI(tk.Tk):
                 ch_cfg = dict(self.cfg)
                 ch_cfg["target_language"] = lang
                 ch_cfg["glossary"] = entries_to_dict(eff_entries)
+                ch_cfg["_translation_cancelled"] = lambda: self.stop_requested
 
                 # Translate metadata
                 meta_values = [metadata.get("title", source.stem)]
@@ -1367,7 +1530,7 @@ class TranslatorGUI(tk.Tk):
                 if len(meta_final) > 1:
                     metadata["description"] = meta_final[1]
 
-                translated_chapters: list[SourceChapter] = []
+                book = TranslationBook(source, work_dir, metadata, lang)
                 for idx, ch in enumerate(chapters, 1):
                     if self.stop_requested:
                         self.log_queue.put(("log", "使用者中止翻譯。\n"))
@@ -1376,6 +1539,11 @@ class TranslatorGUI(tk.Tk):
                     pct = ((idx - 1) / len(chapters)) * 100
                     self.log_queue.put(("progress", pct))
                     self.log_queue.put(("log", f"[{idx}/{len(chapters)}] 翻譯中：{ch.title}\n"))
+                    if book.completed(idx, ch):
+                        self.log_queue.put(("log", "已接續上次完成的章節。\n"))
+                        for output in book.checkpoint(idx, len(chapters)):
+                            self.log_queue.put(("log", f"已儲存 EPUB：{output.name}\n"))
+                        continue
 
                     ep = Episode(url=ch.url, work_title="", episode_title=ch.title,
                                  paragraphs=ch.paragraphs, blocks=ch.blocks)
@@ -1388,19 +1556,22 @@ class TranslatorGUI(tk.Tk):
                     drafts = translate_episode(ep, ch_cfg, work_dir)
                     translations = proofread_episode(ep, drafts, ch_cfg, work_dir) if ch_cfg.get("dual_stage") else drafts
 
-                    translated_ch = SourceChapter(url=ch.url, title=t_final, paragraphs=translations,
-                                                  blocks=ch.blocks, images=ch.images)
-                    translated_chapters.append(translated_ch)
+                    translated_ch = _translated_chapter(ch, translations)
+                    translated_ch.title = t_final
+                    book.save(idx, ch, translated_ch)
+                    for output in book.checkpoint(idx, len(chapters)):
+                        self.log_queue.put(("log", f"已儲存 EPUB：{output.name}\n"))
 
-                    if idx % 5 == 0 or idx == len(chapters):
-                        out_epub = work_dir / f"{safe_name(metadata['title'])}_{'繁中' if '繁' in lang else '簡中'}.epub"
-                        translated_source_epub(metadata, translated_chapters, out_epub, lang)
-                        self.log_queue.put(("log", f"已儲存階段 EPUB：{out_epub.name}\n"))
-
-                out_epub = work_dir / f"{safe_name(metadata['title'])}_{'繁中' if '繁' in lang else '簡中'}.epub"
-                translated_source_epub(metadata, translated_chapters, out_epub, lang)
-                self.log_queue.put(("progress", 100.0))
-                self.log_queue.put(("translate_complete", str(out_epub)))
+                if not self.stop_requested:
+                    out_epub = book.finish(len(chapters))
+                    self.log_queue.put(("progress", 100.0))
+                    self.log_queue.put(("translate_complete", str(out_epub)))
+                else:
+                    self.log_queue.put(("log", "已儲存章節，可重新啟動後接續翻譯。\n"))
+                    self.log_queue.put(("translate_stopped", None))
+            except TranslationCancelled:
+                self.log_queue.put(("log", "已停止翻譯，保留已完成的快取，可重新開始接續。\n"))
+                self.log_queue.put(("translate_stopped", None))
             except Exception as exc:
                 self.log_queue.put(("error", f"翻譯失敗：{exc}"))
 
@@ -1425,7 +1596,7 @@ class TranslatorGUI(tk.Tk):
         ttk.Button(top_f, text="一鍵檢查譯文合規性", command=self._action_audit_compliance).grid(row=0, column=3, padx=4, pady=4)
 
         # Violations Table
-        lbl_v = ttk.Label(f, text="術語合規警示清單（日文原文有出現但中文譯文未落實）：", font=("Microsoft JhengHei UI", 9, "bold"))
+        lbl_v = ttk.Label(f, text="術語合規警示清單（日文原文有出現但中文譯文未落實）：", font=("Microsoft JhengHei UI", 11, "bold"))
         lbl_v.pack(anchor=tk.W, pady=(4, 2))
 
         v_frame = ttk.Frame(f)
@@ -1547,9 +1718,9 @@ class TranslatorGUI(tk.Tk):
 
         def _worker():
             try:
-                ensure_model(self.cfg)
+                ensure_model(self.cfg, interactive=False)
                 if self.cfg.get("dual_stage"):
-                    ensure_model(self.cfg, self.cfg["review_model"])
+                    ensure_model(self.cfg, self.cfg["review_model"], interactive=False)
 
                 ch_cfg = dict(self.cfg)
                 ch_cfg["target_language"] = project.get("language", self.cfg.get("target_language", "繁體中文"))
@@ -1626,6 +1797,9 @@ class TranslatorGUI(tk.Tk):
                     self.progress_var.set(payload)
                 elif msg_type == "error":
                     self._set_busy(False)
+                    self.status_var.set("執行未完成 · 請查看日誌")
+                    if not self.log_panel.winfo_manager():
+                        self._toggle_log()
                     self.log_text.insert(tk.END, f"[錯誤] {payload}\n")
                     self.log_text.see(tk.END)
                     messagebox.showerror("執行錯誤", payload)
@@ -1649,6 +1823,8 @@ class TranslatorGUI(tk.Tk):
                     self._set_busy(False)
                     self.log_text.insert(tk.END, f"中文 EPUB 翻譯完成：{payload}\n")
                     messagebox.showinfo("翻譯完成", f"中文 EPUB 電子書已成功生成：\n{payload}")
+                elif msg_type == "translate_stopped":
+                    self._set_busy(False)
                 elif msg_type == "candidates_ready":
                     self._set_busy(False)
                     self._candidate_review_dialog(payload)

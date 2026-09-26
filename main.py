@@ -260,10 +260,17 @@ def pull_model(cfg: dict[str, Any], model: str) -> None:
     print(f"\n模型 {model} 已准备完成。")
 
 
-def ensure_model(cfg: dict[str, Any], model: str | None = None) -> bool:
+def ensure_model(cfg: dict[str, Any], model: str | None = None, interactive: bool = True) -> bool:
     model = model or cfg["model"]
-    if model_is_installed(model, installed_models(cfg)):
+    names = installed_models(cfg)
+    if model_is_installed(model, names):
         return True
+    if not interactive:
+        available = "、".join(sorted(names)) or "無"
+        raise RuntimeError(
+            f"Ollama 找不到模型 {model}。已安裝的模型：{available}。"
+            "請在 config.json 設定與 Ollama 完全相同的模型名稱。"
+        )
     answer = input(f"尚未安装 {model}。现在由 Ollama 自动下载？[Y/n] ").strip().lower()
     if answer == "n":
         print("已取消模型切换。")
@@ -359,8 +366,39 @@ def report_and_check_compliance(
     return translations
 
 
+def ollama_chat_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
+    base = cfg["ollama_url"].rstrip("/")
+    streamed_payload = dict(payload)
+    streamed_payload["stream"] = True
+    response = requests.post(
+        f"{base}/api/chat",
+        json=streamed_payload,
+        stream=True,
+        timeout=cfg.get("request_timeout_seconds", 600),
+    )
+    try:
+        response.raise_for_status()
+        content_parts: list[str] = []
+        for raw in response.iter_lines():
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise RuntimeError(f"Ollama 回傳了無效資料：{str(raw)[:300]}") from exc
+            if event.get("error"):
+                raise RuntimeError(f"Ollama 生成失敗：{event['error']}")
+            content_parts.append(str(event.get("message", {}).get("content", "")))
+        return "".join(content_parts)
+    finally:
+        response.close()
+
+
 def translate_chunk(
-    paragraphs: list[str], cfg: dict[str, Any], previous_context: str = ""
+    paragraphs: list[str], cfg: dict[str, Any], previous_context: str = "",
+    *, _repeat_retry: bool = False,
 ) -> list[str]:
     numbered = "\n".join(f"[{i}] {p}" for i, p in enumerate(paragraphs, 1))
     system = f"""你是專業日文小說譯者。把輸入翻譯成{cfg['target_language']}。
@@ -377,41 +415,62 @@ def translate_chunk(
     user = f"前文語境（僅供參考，不要重譯）：\n{previous_context[-context_chars:]}\n\n待翻譯段落：\n{numbered}"
     payload = {
         "model": cfg["model"],
-        "stream": False,
         "format": "json",
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "options": {"temperature": cfg.get("temperature", 0.2)},
+        "options": {"temperature": max(0.5, float(cfg.get("temperature", 0.2))) if _repeat_retry else cfg.get("temperature", 0.2)},
     }
-    base = cfg["ollama_url"].rstrip("/")
-    r = requests.post(
-        f"{base}/api/chat",
-        json=payload,
-        timeout=cfg.get("request_timeout_seconds", 600),
-    )
-    r.raise_for_status()
-    content = r.json().get("message", {}).get("content", "")
+    try:
+        content = ollama_chat_content(payload, cfg)
+    except RuntimeError as exc:
+        if "token repeat limit reached" not in str(exc).lower():
+            raise
+        if len(paragraphs) > 1:
+            print(f"  模型遇到重複 token 限制，自動拆分 {len(paragraphs)} 段重試……", flush=True)
+            midpoint = len(paragraphs) // 2
+            first = translate_chunk(paragraphs[:midpoint], cfg, previous_context)
+            continued_context = "\n".join(part for part in [previous_context, *first] if part)
+            return first + translate_chunk(paragraphs[midpoint:], cfg, continued_context)
+        if _repeat_retry:
+            raise
+        print("  模型遇到重複 token 限制，單段改用較高溫度重試一次……", flush=True)
+        return translate_chunk(paragraphs, cfg, "", _repeat_retry=True)
     try:
         result = json.loads(content)
         translations = result["translations"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RuntimeError(f"模型沒有回傳有效 JSON：{content[:300]}") from exc
     if not isinstance(translations, list) or len(translations) != len(paragraphs):
+        returned_count = len(translations) if isinstance(translations, list) else 0
+        if len(paragraphs) > 1:
+            midpoint = len(paragraphs) // 2
+            print(
+                f"  模型回傳 {returned_count}/{len(paragraphs)} 段，"
+                "自動拆成較小批次重試……",
+                flush=True,
+            )
+            first = translate_chunk(paragraphs[:midpoint], cfg, previous_context)
+            continued_context = "\n".join(
+                part for part in [previous_context, *first] if part
+            )
+            second = translate_chunk(paragraphs[midpoint:], cfg, continued_context)
+            return first + second
         raise RuntimeError(
-            f"模型回傳 {len(translations) if isinstance(translations, list) else 0} 段，"
-            f"但預期 {len(paragraphs)} 段。請降低 translation_chunk_chars 後重試。"
+            f"模型回傳 {returned_count} 段，但預期 1 段。"
         )
     return [normalize_text(str(x)) for x in translations]
 
 
-def make_batches(paragraphs: list[str], limit: int) -> list[list[str]]:
+def make_batches(
+    paragraphs: list[str], limit: int, max_items: int = 40
+) -> list[list[str]]:
     batches: list[list[str]] = []
     current: list[str] = []
     size = 0
     for paragraph in paragraphs:
-        if current and size + len(paragraph) > limit:
+        if current and (size + len(paragraph) > limit or len(current) >= max_items):
             batches.append(current)
             current, size = [], 0
         current.append(paragraph)
@@ -431,6 +490,51 @@ def atomic_json(path: Path, value: Any) -> None:
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(path)
+
+
+class TranslationCancelled(Exception):
+    """The user stopped translation, including while waiting for a retry."""
+
+
+def run_translation_batch(operation, cfg: dict[str, Any], label: str):
+    """Retry only a failed model batch; callers persist successful batches."""
+    retries = max(0, int(cfg.get("translation_max_retries", 5)))
+    delay = max(0.0, float(cfg.get("translation_retry_delay_seconds", 10)))
+    cancelled = cfg.get("_translation_cancelled", lambda: False)
+
+    def check_cancelled():
+        if cancelled():
+            raise TranslationCancelled()
+
+    for attempt in range(retries + 1):
+        check_cancelled()
+        try:
+            return operation()
+        except (requests.RequestException, RuntimeError) as exc:
+            if isinstance(exc, requests.HTTPError):
+                status = exc.response.status_code if exc.response is not None else None
+                if status not in (408, 429, 500, 502, 503, 504):
+                    raise
+            elif isinstance(exc, requests.RequestException):
+                if not isinstance(exc, (requests.ConnectionError, requests.Timeout,
+                                        requests.exceptions.ChunkedEncodingError)):
+                    raise
+            elif any(marker in str(exc).lower() for marker in (
+                "not found", "does not exist", "unauthorized", "forbidden",
+            )):
+                raise
+            if attempt == retries:
+                raise
+            wait = min(delay * (2 ** min(attempt, 10)), 60.0)
+            print(f"  [{label}自動重試] {exc}；{wait:g} 秒後重試 "
+                  f"({attempt + 1}/{retries})，保留已完成進度。", flush=True)
+            # Short sleeps keep GUI cancellation responsive during backoff.
+            remaining = wait
+            while remaining > 0:
+                check_cancelled()
+                interval = min(remaining, 0.2)
+                time.sleep(interval)
+                remaining -= interval
 
 
 def translate_episode(episode: Episode, cfg: dict[str, Any], work_dir: Path) -> list[str]:
@@ -456,13 +560,19 @@ def translate_episode(episode: Episode, cfg: dict[str, Any], work_dir: Path) -> 
             positions.append(i)
 
     if missing:
-        batches = make_batches(missing, int(cfg.get("translation_chunk_chars", 2200)))
+        batches = make_batches(
+            missing,
+            int(cfg.get("translation_chunk_chars", 2200)),
+            int(cfg.get("translation_chunk_paragraphs", 40)),
+        )
         cursor = 0
         print(f"需要翻譯 {len(missing)} 段，共 {len(batches)} 批。")
         for batch_no, batch in enumerate(batches, 1):
             print(f"  翻譯第 {batch_no}/{len(batches)} 批……", flush=True)
             context = "\n".join(x for x in translated[: positions[cursor]] if x)
-            result = translate_chunk(batch, cfg, context)
+            result = run_translation_batch(
+                lambda: translate_chunk(batch, cfg, context), cfg, "翻譯"
+            )
             for source, target in zip(batch, result):
                 pos = positions[cursor]
                 translated[pos] = target
@@ -495,7 +605,8 @@ def make_review_batches(
 
 
 def review_chunk(
-    pairs: list[tuple[str, str]], cfg: dict[str, Any], previous_final: str
+    pairs: list[tuple[str, str]], cfg: dict[str, Any], previous_final: str,
+    *, _repeat_retry: bool = False,
 ) -> list[str]:
     items = "\n".join(
         f"[{index}]\n日文：{original}\n初译：{draft}"
@@ -519,21 +630,28 @@ def review_chunk(
     )
     payload = {
         "model": cfg["review_model"],
-        "stream": False,
         "format": "json",
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "options": {"temperature": min(float(cfg.get("temperature", 0.2)), 0.15)},
+        "options": {"temperature": max(0.5, float(cfg.get("temperature", 0.2))) if _repeat_retry else min(float(cfg.get("temperature", 0.2)), 0.15)},
     }
-    base = cfg["ollama_url"].rstrip("/")
-    response = requests.post(
-        f"{base}/api/chat", json=payload,
-        timeout=cfg.get("request_timeout_seconds", 600),
-    )
-    response.raise_for_status()
-    content = response.json().get("message", {}).get("content", "")
+    try:
+        content = ollama_chat_content(payload, cfg)
+    except RuntimeError as exc:
+        if "token repeat limit reached" not in str(exc).lower():
+            raise
+        if len(pairs) > 1:
+            print(f"  校對模型遇到重複 token 限制，自動拆分 {len(pairs)} 段重試……", flush=True)
+            midpoint = len(pairs) // 2
+            first = review_chunk(pairs[:midpoint], cfg, previous_final)
+            continued_context = "\n".join(part for part in [previous_final, *first] if part)
+            return first + review_chunk(pairs[midpoint:], cfg, continued_context)
+        if _repeat_retry:
+            raise
+        print("  校對模型遇到重複 token 限制，單段改用較高溫度重試一次……", flush=True)
+        return review_chunk(pairs, cfg, "", _repeat_retry=True)
     try:
         translations = json.loads(content)["translations"]
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -580,7 +698,9 @@ def proofread_episode(
             print(f"  校对第 {batch_no}/{len(batches)} 批……", flush=True)
             position = missing_positions[cursor]
             previous = "\n".join(value for value in final[:position] if value)
-            reviewed = review_chunk(batch, cfg, previous)
+            reviewed = run_translation_batch(
+                lambda: review_chunk(batch, cfg, previous), cfg, "校對"
+            )
             for value in reviewed:
                 pos = missing_positions[cursor]
                 final[pos] = value
@@ -716,6 +836,14 @@ def import_epub(cfg: dict[str, Any]) -> Path | None:
     work_title = info["title"]
     work_dir = output_root / safe_name(work_title)
     work_dir.mkdir(parents=True, exist_ok=True)
+    existing = load_json(work_dir / "project.json", {})
+    if existing:
+        base = work_dir / existing.get("base_epub", "base-original.epub")
+        if not base.exists() or hashlib.sha256(base.read_bytes()).digest() != hashlib.sha256(path.read_bytes()).digest():
+            raise ValueError("已有同名作品專案，但 EPUB 母版不同；請使用原母版或更換作品資料夾。")
+        save_last_project(work_dir)
+        print(f"已接續既有作品專案（{len(existing.get('chapters', []))} 章），不覆蓋舊文章。")
+        return work_dir
     project = create_project_from_epub(path, work_dir)
     print(f"\n作品：{work_title}")
     print(f"作者：{project.get('author') or 'EPUB 未提供'}")
@@ -800,7 +928,7 @@ def browser_mode(cfg: dict[str, Any], fixed_work_dir: Path | None = None) -> Non
                     translations = drafts
                 images = download_episode_images(context, episode, work_dir)
                 next_pending = pending_epub_updates + 1
-                build_now = not chapter_cfg.get("dual_stage") or next_pending >= 5
+                build_now = next_pending >= 10
                 epub_path = add_or_update_project(
                     episode, translations, work_dir, chapter_cfg, images,
                     drafts=drafts if chapter_cfg.get("dual_stage") else None,
@@ -812,7 +940,7 @@ def browser_mode(cfg: dict[str, Any], fixed_work_dir: Path | None = None) -> Non
                     print(f"完成并更新 EPUB：{epub_path}\n")
                 else:
                     print(
-                        f"校对终稿已保存；累计 {pending_epub_updates}/5 章后更新 EPUB。\n"
+                        f"校对终稿已保存；累计 {pending_epub_updates}/10 章后更新 EPUB。\n"
                     )
             except KeyboardInterrupt:
                 print("\n已中止本章；已完成的翻譯批次仍保留在快取中。")
@@ -994,6 +1122,80 @@ def _translated_chapter(chapter: SourceChapter, translations: list[str]) -> Sour
                          blocks=blocks, images=chapter.images)
 
 
+class TranslationBook:
+    """Persist completed chapters and build small EPUBs before merging the full book."""
+
+    def __init__(self, source: Path, work_dir: Path, metadata: dict[str, Any], language: str):
+        self.work_dir = work_dir
+        self.language = language
+        self.path = work_dir / "translation-project.json"
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        saved = load_json(self.path, {})
+        if saved and (saved.get("source_hash"), saved.get("language")) != (source_hash, language):
+            raise ValueError("翻譯專案的原文或目標語言已變更，請使用另一個輸出資料夾。")
+        self.state = saved or {"source_hash": source_hash, "language": language,
+                               "metadata": metadata, "chapters": []}
+        self.metadata = self.state["metadata"]
+        self.output = work_dir / f"{safe_name(self.metadata['title'])}_{'繁中' if '繁' in language else '简中'}.epub"
+
+    def completed(self, index: int, chapter: SourceChapter) -> bool:
+        records = self.state["chapters"]
+        if index > len(records):
+            return False
+        if records[index - 1]["url"] != chapter.url or (
+            records[index - 1]["source_hash"] != compute_content_hash(chapter.paragraphs)
+        ):
+            raise ValueError("原文章節已變更，請使用另一個輸出資料夾以免覆蓋已譯內容。")
+        return True
+
+    def save(self, index: int, original: SourceChapter, translated: SourceChapter) -> None:
+        if index != len(self.state["chapters"]) + 1:
+            raise ValueError("章節必須依原書順序接續寫入。")
+        self.state["chapters"].append({
+            "url": original.url, "source_hash": compute_content_hash(original.paragraphs),
+            "title": translated.title, "paragraphs": translated.paragraphs,
+            "blocks": translated.blocks,
+            "images": [{k: str(v) if isinstance(v, Path) else v for k, v in image.items()
+                        if k != "data"} for image in translated.images],
+        })
+        atomic_json(self.path, self.state)
+
+    def _chapters(self, start: int, end: int) -> list[SourceChapter]:
+        return [SourceChapter(url=record["url"], title=record["title"],
+                              paragraphs=record["paragraphs"], blocks=record["blocks"],
+                              images=record["images"])
+                for record in self.state["chapters"][start - 1:end]]
+
+    def _build(self, start: int, end: int, output: Path) -> Path:
+        temporary = output.with_suffix(".tmp.epub")
+        translated_source_epub(self.metadata, self._chapters(start, end), temporary, self.language)
+        temporary.replace(output)
+        return output
+
+    def checkpoint(self, index: int, total: int) -> list[Path]:
+        outputs = []
+        if index % 10 == 0 or index == total:
+            start = ((index - 1) // 10) * 10 + 1
+            part = self.work_dir / f"{self.output.stem}_{start:04d}-{index:04d}.epub"
+            if not part.exists():
+                outputs.append(self._build(start, index, part))
+        if index % 100 == 0 and (
+            self.state.get("merged_up_to", 0) < index or not self.output.exists()
+        ):
+            outputs.append(self._build(1, index, self.output))
+            self.state["merged_up_to"] = index
+            atomic_json(self.path, self.state)
+        return outputs
+
+    def finish(self, total: int) -> Path:
+        if len(self.state["chapters"]) != total:
+            raise ValueError("尚有章節未完成，不能合併全書。")
+        output = self._build(1, total, self.output)
+        self.state["merged_up_to"] = total
+        atomic_json(self.path, self.state)
+        return output
+
+
 def translate_source_epub(
     cfg: dict[str, Any],
     append_to_existing: bool,
@@ -1040,10 +1242,15 @@ def translate_source_epub(
         metadata["title"] = meta_final[0]
         if len(meta_final) > 1:
             metadata["description"] = meta_final[1]
-    translated_chapters: list[SourceChapter] = []
+    book = TranslationBook(source, work_dir, metadata, language) if not append_to_existing else None
     print(f"读取到 {len(chapters)} 个正文章节；目标：{language}。")
     for index, chapter in enumerate(chapters, 1):
         print(f"\n[{index}/{len(chapters)}] {chapter.title}")
+        if book and book.completed(index, chapter):
+            print("已接續上次完成的章節。")
+            for output in book.checkpoint(index, len(chapters)):
+                print(f"已寫入 EPUB：{output}")
+            continue
         episode = _episode_from_source(chapter)
         title_episode = Episode(url=chapter.url + "#title", work_title="",
                                 episode_title=chapter.title, paragraphs=[chapter.title],
@@ -1062,20 +1269,32 @@ def translate_source_epub(
                 local = Path(image["local_path"])
                 images.append({"key": image["key"], "local_path": str(local.relative_to(work_dir)),
                                "media_type": image["media_type"], "alt": image.get("alt", "")})
-            build_now = (not chapter_cfg.get("dual_stage")) or index % 5 == 0 or index == len(chapters)
-            output = add_or_update_project(episode, translations, work_dir, chapter_cfg, images,
-                                           drafts=drafts if chapter_cfg.get("dual_stage") else None,
-                                           build_now=build_now)
-            if output:
-                print(f"已更新：{output}")
+            add_or_update_project(episode, translations, work_dir, chapter_cfg, images,
+                                  drafts=drafts if chapter_cfg.get("dual_stage") else None,
+                                  build_now=False)
+            if index % 10 == 0 or index == len(chapters):
+                current = load_json(work_dir / "project.json", {})
+                count = 10 if index % 10 == 0 else index % 10
+                part = work_dir / f"{safe_name(current['work_title'])}-續譯_{index - count + 1:04d}-{index:04d}.epub"
+                build_extended_epub({**current, "chapters": current["chapters"][-count:]}, work_dir, part)
+                print(f"已寫入階段 EPUB：{part}")
+            if index % 100 == 0 or index == len(chapters):
+                current = load_json(work_dir / "project.json", {})
+                output = build_extended_epub(current, work_dir)
+                current["epub_dirty"] = False
+                atomic_json(work_dir / "project.json", current)
+                print(f"已合併到原書：{output}")
         else:
             translated_chapter = _translated_chapter(chapter, translations)
             translated_chapter.title = translated_title
-            translated_chapters.append(translated_chapter)
-            if index % 5 == 0 or index == len(chapters):
-                output = work_dir / f"{safe_name(metadata['title'])}_{'繁中' if '繁' in language else '简中'}.epub"
-                translated_source_epub(metadata, translated_chapters, output, language)
-                print(f"已写入阶段 EPUB：{output}")
+            book.save(index, chapter, translated_chapter)
+            for output in book.checkpoint(index, len(chapters)):
+                print(f"已寫入 EPUB：{output}")
+    if book:
+        print(f"已合併全部章節：{book.finish(len(chapters))}")
+    elif len(chapters) % 100 == 0:
+        current = load_json(work_dir / "project.json", {})
+        print(f"已再次合併全部章節：{build_extended_epub(current, work_dir)}")
     print("\n处理完成。")
 
 

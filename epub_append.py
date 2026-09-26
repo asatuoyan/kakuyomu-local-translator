@@ -175,9 +175,9 @@ def _chapter_xhtml(title: str, blocks: list[dict[str, str]], image_hrefs: dict[s
     return "\n".join(content).encode("utf-8")
 
 
-def build_extended_epub(project: dict[str, Any], work_dir: Path) -> Path:
+def build_extended_epub(project: dict[str, Any], work_dir: Path, output: Path | None = None) -> Path:
     base = work_dir / project["base_epub"]
-    output = work_dir / f"{project['work_title']}-續譯.epub"
+    output = output or work_dir / f"{project['work_title']}-續譯.epub"
     if not project.get("chapters"):
         shutil.copy2(base, output)
         return output
