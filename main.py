@@ -15,6 +15,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from app_config import (APP_DIR, CONFIG_PATH, DEFAULT_MODEL, TRANSLATION_MODELS,
+                        load_config as read_app_config, update_config)
 from project_storage import (TranslationCache, atomic_json, load_json,
                              load_translation_state, save_translation_state)
 from quality_checks import check_translation_quality
@@ -61,15 +63,6 @@ from text_importer import (
 )
 
 
-APP_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = APP_DIR / "config.json"
-TRANSLATION_MODELS = {
-    "Hy-MT2 7B Q6_K": "hf.co/tencent/Hy-MT2-7B-GGUF:Q6_K",
-    "Hy-MT2 7B Q4_K_M": "hf.co/tencent/Hy-MT2-7B-GGUF:Q4_K_M",
-}
-DEFAULT_MODEL = TRANSLATION_MODELS["Hy-MT2 7B Q4_K_M"]
-
-
 @dataclass
 class Episode:
     url: str
@@ -109,19 +102,7 @@ def select_file(
 
 
 def load_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(
-            (APP_DIR / "config.example.json").read_text(encoding="utf-8"),
-            encoding="utf-8",
-        )
-    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    if cfg.get("model") not in TRANSLATION_MODELS.values():
-        cfg["model"] = DEFAULT_MODEL
-    cfg["output_dir"] = str((APP_DIR / cfg.get("output_dir", "output")).resolve())
-    cfg["browser_profile_dir"] = str(
-        (APP_DIR / cfg.get("browser_profile_dir", "browser-profile")).resolve()
-    )
-    return cfg
+    return read_app_config(CONFIG_PATH, APP_DIR)
 
 
 def safe_name(value: str, fallback: str = "未命名作品") -> str:
@@ -1527,7 +1508,7 @@ def scan_glossary_flow(cfg: dict[str, Any]) -> None:
         existing_entries = dict_to_entries(cfg.get("glossary", {}))
         merged = merge_glossaries(existing_entries, entries, overwrite=True)
         cfg["glossary"] = entries_to_dict(merged)
-        atomic_json(CONFIG_PATH, cfg)
+        update_config({"glossary": cfg["glossary"]}, CONFIG_PATH, APP_DIR)
         print(f"已成功更新至 config.json（目前共 {len(cfg['glossary'])} 條術語）！")
 
     exp = input("是否將本次生成的術語表匯出為檔案 (CSV / Excel / JSON)？[y/N] ").strip().lower()
@@ -1566,7 +1547,7 @@ def import_glossary_flow(cfg: dict[str, Any]) -> None:
             existing = dict_to_entries(cfg.get("glossary", {}))
             merged = merge_glossaries(existing, entries, overwrite=True)
             cfg["glossary"] = entries_to_dict(merged)
-        atomic_json(CONFIG_PATH, cfg)
+        update_config({"glossary": cfg["glossary"]}, CONFIG_PATH, APP_DIR)
         print(f"已成功匯入並更新 config.json（目前共 {len(cfg['glossary'])} 條有效術語）。")
     except Exception as exc:
         print(f"匯入失敗：{exc}")
@@ -1633,7 +1614,7 @@ def add_edit_glossary_flow(cfg: dict[str, Any]) -> None:
     new_entry = GlossaryEntry(source=src, target=tgt, category=cat, note=note)
     merged = merge_glossaries(entries, [new_entry], overwrite=True)
     cfg["glossary"] = entries_to_dict(merged)
-    atomic_json(CONFIG_PATH, cfg)
+    update_config({"glossary": cfg["glossary"]}, CONFIG_PATH, APP_DIR)
     print(f"已儲存術語：「{src}」 => 「{tgt}」【{cat}】")
 
 
@@ -1742,7 +1723,7 @@ def heuristic_candidate_flow(cfg: dict[str, Any]) -> None:
             existing = dict_to_entries(cfg.get("glossary", {}))
             merged = merge_glossaries(existing, entries, overwrite=False)
             cfg["glossary"] = entries_to_dict(merged)
-            atomic_json(CONFIG_PATH, cfg)
+            update_config({"glossary": cfg["glossary"]}, CONFIG_PATH, APP_DIR)
             print(f"已儲存至全域設定檔 config.json（共 {len(cfg['glossary'])} 條）")
 
 

@@ -74,7 +74,6 @@ from main import (
     _select_range,
     add_or_update_project,
     ensure_model,
-    installed_models,
     load_config,
     load_json,
     atomic_json,
@@ -86,6 +85,9 @@ from main import (
 from playwright.sync_api import sync_playwright
 from epub_append import build_extended_epub, create_project_from_epub, inspect_epub
 from languages import LANGUAGES, language_name
+from gui_settings import SettingsDialog
+from gui_task_state import TaskStateMixin
+from app_config import update_config
 from main import (translate_epub_language, load_review_project, MissingProjectSource,
                   audit_project, project_glossary, retranslate_project)
 
@@ -195,7 +197,9 @@ class PageHost(ttk.Frame):
         self.event_generate("<<NotebookTabChanged>>")
 
 
-class TranslatorGUI(tk.Tk):
+class TranslatorGUI(TaskStateMixin, tk.Tk):
+    _dialogs = messagebox
+
     def __init__(self):
         super().__init__()
         self.title(ui_text("小說下載與本地 AI 翻譯器 (Kakuyomu / 小說家になろう)"))
@@ -206,7 +210,7 @@ class TranslatorGUI(tk.Tk):
         self.log_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.active_thread: threading.Thread | None = None
         self.stop_requested = False
-        self.ui_theme = load_json(CONFIG_PATH, {}).get("ui_theme", "light")
+        self.ui_theme = self.cfg.get("ui_theme", "light")
         if self.ui_theme not in UI_PALETTES:
             self.ui_theme = "light"
 
@@ -554,49 +558,10 @@ class TranslatorGUI(tk.Tk):
         self.current_work_var.set(f"{name[:28]}{'…' if len(name) > 28 else ''}" if name else "")
 
     def _save_preferences(self):
-        config = load_json(CONFIG_PATH, {})
-        config["ui_theme"] = self.ui_theme
-        atomic_json(CONFIG_PATH, config)
+        update_config({"ui_theme": self.ui_theme}, CONFIG_PATH)
 
     def _open_settings(self):
-        window = tk.Toplevel(self)
-        window.title("设置")
-        window.geometry("480x350")
-        window.resizable(False, False)
-        window.configure(background=self.palette["background"])
-        self._set_titlebar_theme(window)
-        frame = ttk.Frame(window, padding=24)
-        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        ttk.Label(frame, text="模型与连接", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor=tk.W, pady=(0, 14))
-        ttk.Label(frame, text="翻译模型").pack(anchor=tk.W)
-        model_var = tk.StringVar(value=self.tr_model_var.get())
-        model_box = ttk.Combobox(frame, textvariable=model_var,
-                                 values=list(TRANSLATION_MODELS.values()), state="readonly")
-        model_box.pack(fill=tk.X, pady=(4, 12))
-        ttk.Label(frame, text="Ollama 地址").pack(anchor=tk.W)
-        url_var = tk.StringVar(value=self.cfg["ollama_url"])
-        ttk.Entry(frame, textvariable=url_var).pack(fill=tk.X, pady=(4, 14))
-        ttk.Label(frame, text="界面主题").pack(anchor=tk.W)
-        theme_var = tk.StringVar(value="深色模式" if self.ui_theme == "dark" else "浅色模式")
-        ttk.Combobox(frame, textvariable=theme_var, values=("浅色模式", "深色模式"),
-                     state="readonly").pack(fill=tk.X, pady=(4, 8))
-
-        def save():
-            url = url_var.get().strip().rstrip("/")
-            if not re.match(r"^https?://[^\s/]+", url):
-                messagebox.showerror("地址无效", "请输入以 http:// 或 https:// 开头的 Ollama 地址。")
-                return
-            config = load_json(CONFIG_PATH, {})
-            config.update(model=model_var.get(), ollama_url=url, ui_theme=self.ui_theme)
-            atomic_json(CONFIG_PATH, config)
-            self.cfg.update(model=model_var.get(), ollama_url=url)
-            self.tr_model_var.set(model_var.get())
-            if (theme_var.get() == "深色模式") != (self.ui_theme == "dark"):
-                self._toggle_theme()
-            window.destroy()
-
-        ttk.Button(frame, text="保存设置", command=save, style="Accent.TButton").pack(anchor=tk.E, pady=(12, 0))
-
+        SettingsDialog(self)
 
     def _localize_status(self):
         value = self.status_var.get()
@@ -1523,7 +1488,7 @@ class TranslatorGUI(tk.Tk):
                 messagebox.showinfo("成功", f"已成功儲存作品專屬術語表：\n{target_path}")
         else:
             self.cfg["glossary"] = entries_to_dict(self.current_glossary_entries)
-            atomic_json(CONFIG_PATH, self.cfg)
+            update_config({"glossary": self.cfg["glossary"]}, CONFIG_PATH)
             if not silent:
                 messagebox.showinfo("成功", f"已成功更新至全域設定檔：\n{CONFIG_PATH}")
 
@@ -1702,9 +1667,14 @@ class TranslatorGUI(tk.Tk):
                   style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 6))
 
         self.tr_model_var = tk.StringVar(value=self.cfg["model"])
-        for label, model in TRANSLATION_MODELS.items():
-            ttk.Radiobutton(opt_frame, text=label, variable=self.tr_model_var,
-                            value=model).pack(anchor=tk.W, pady=7)
+        ttk.Label(opt_frame, text="翻译模型").pack(anchor=tk.W, pady=(8, 4))
+        self.tr_model_box = ttk.Combobox(
+            opt_frame, textvariable=self.tr_model_var,
+            values=list(dict.fromkeys([self.cfg["model"], *TRANSLATION_MODELS.values()])),
+        )
+        self.tr_model_box.pack(fill=tk.X)
+        ttk.Label(opt_frame, text="可在设置中读取 Ollama 已安装模型。",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(4, 0))
 
         # Progress / action buttons
         btn_box = ttk.Frame(f)
@@ -1736,7 +1706,11 @@ class TranslatorGUI(tk.Tk):
         if not languages:
             messagebox.showwarning("提示", "請至少選擇一種輸出語言。")
             return
-        self.cfg["model"] = self.tr_model_var.get()
+        model = self.tr_model_var.get().strip()
+        if not model:
+            messagebox.showwarning("提示", "请先选择或输入翻译模型。")
+            return
+        self.cfg["model"] = model
 
         task_cfg = dict(self.cfg)
         task_cfg["_translation_cancelled"] = lambda: self.stop_requested
@@ -2074,126 +2048,6 @@ class TranslatorGUI(tk.Tk):
             except Exception as exc:
                 self.log_queue.put(("error", f"局部重译失败：{exc}"))
         threading.Thread(target=_worker, daemon=True).start()
-
-    # ==========================================
-    # Global State & Helpers
-    # ==========================================
-    def _set_busy(self, busy: bool, status_msg: str = ""):
-        if busy:
-            self._busy_button_states = []
-
-            def disable(parent):
-                for widget in parent.winfo_children():
-                    if (isinstance(widget, (ttk.Button, tk.Button))
-                            and widget not in (self.log_toggle, self.function_button,
-                                               self.settings_button)
-                            and widget not in self.navigation_buttons):
-                        self._busy_button_states.append((widget, str(widget.cget("state"))))
-                        widget.configure(state=tk.DISABLED)
-                    disable(widget)
-
-            disable(self)
-        else:
-            for widget, state in getattr(self, "_busy_button_states", []):
-                if widget.winfo_exists():
-                    widget.configure(state=state)
-            self._busy_button_states = []
-        if busy:
-            self.status_var.set(status_msg)
-            self.progress_var.set(0.0)
-            if hasattr(self, "btn_start_dl"):
-                self.btn_start_dl.config(state=tk.DISABLED)
-            if hasattr(self, "btn_start_tr"):
-                self.btn_start_tr.config(state=tk.DISABLED)
-        else:
-            self.status_var.set("就緒")
-            if hasattr(self, "btn_start_dl"):
-                self.btn_start_dl.config(state=tk.NORMAL)
-            if hasattr(self, "btn_start_tr"):
-                self.btn_start_tr.config(state=tk.NORMAL)
-            if hasattr(self, "btn_stop"):
-                self.btn_stop.config(state=tk.DISABLED)
-
-    def _poll_queue(self):
-        try:
-            while True:
-                msg_type, payload = self.log_queue.get_nowait()
-                if msg_type == "log":
-                    self.log_text.insert(tk.END, payload)
-                    self.log_text.see(tk.END)
-                elif msg_type == "progress":
-                    self.progress_var.set(payload)
-                elif msg_type == "status":
-                    self.status_var.set(payload)
-                elif msg_type == "error":
-                    self._set_busy(False)
-                    self.status_var.set("執行未完成 · 請查看日誌")
-                    if self.audit_state_var.get() == "检查中":
-                        self.audit_state_var.set("检查失败")
-                        self.audit_empty_var.set("检查失败，请查看运行日志后重试")
-                    if not self.log_panel.winfo_manager():
-                        self._toggle_log()
-                    self.log_toggle.configure(text="运行日志 ·")
-                    self.log_text.insert(tk.END, f"[錯誤] {payload}\n")
-                    self.log_text.see(tk.END)
-                    messagebox.showerror("執行錯誤", payload)
-                elif msg_type == "toc_loaded":
-                    self._set_busy(False)
-                    work: WorkInfo = payload
-                    self.current_work = work
-                    self._update_current_work()
-                    self.dl_info_lbl.config(
-                        text=f"作品：{work.title} | 作者：{work.author or '未提供'} | 可訪問章節：{len(work.episodes)} 章"
-                    )
-                    self.dl_start_var.set("1")
-                    self.dl_end_var.set(str(len(work.episodes)))
-                    for i, ep in enumerate(work.episodes, 1):
-                        self.dl_toc_listbox.insert(tk.END, f"{i:4d}. {ep['title']}")
-                    self.log_text.insert(tk.END, f"成功讀取作品《{work.title}》目錄，共 {len(work.episodes)} 章。\n")
-                elif msg_type == "download_complete":
-                    self._set_busy(False)
-                    self.log_text.insert(tk.END, f"日文 EPUB 下載完成：{payload}\n")
-                    messagebox.showinfo("下載完成", f"日文原文 EPUB 已成功生成：\n{payload}")
-                elif msg_type == "translate_complete":
-                    self._set_busy(False)
-                    self.log_text.insert(tk.END, f"EPUB 翻譯完成：\n{payload}\n")
-                    messagebox.showinfo("翻譯完成", f"各語言 EPUB 已成功生成：\n{payload}")
-                elif msg_type == "translate_stopped":
-                    self._set_busy(False)
-                elif msg_type == "candidates_ready":
-                    self._set_busy(False)
-                    self._candidate_review_dialog(payload)
-                elif msg_type == "ai_entities_ready":
-                    self._set_busy(False)
-                    self._candidate_review_dialog(payload)
-                elif msg_type == "violation":
-                    ch_title, v = payload
-                    summary = (f"{v.source} → {v.expected_target}" if v.source else
-                               (v.suggested_fix or v.translated_text or v.original_text))
-                    status = self.audit_saved_status.get(self._audit_item_key(ch_title, v), "待核对")
-                    item = self.violation_tree.insert("", tk.END, values=(
-                        f"{ch_title} · {v.paragraph_index}", v.category,
-                        summary[:90], status))
-                    self.audit_items[item] = (ch_title, v)
-                elif msg_type == "audit_complete":
-                    self._set_busy(False)
-                    self._update_audit_count()
-                    if payload:
-                        self.audit_empty.pack_forget()
-                        self.audit_results.pack(fill=tk.BOTH, expand=True)
-                    else:
-                        self.audit_empty_var.set("未发现问题")
-                elif msg_type == "retranslate_complete":
-                    self._set_busy(False)
-                    self._on_audit_project_change()
-                    self.audit_state_var.set("译文已更新 · 请重新检查")
-                    self.audit_empty_var.set("译文已更新，请重新检查以刷新问题列表")
-                    self.log_text.insert(tk.END, f"局部重譯完成！EPUB 已更新：{payload}\n")
-                    messagebox.showinfo("局部重譯完成", f"受影響章節已局部重譯完成，EPUB 電子書已更新：\n{payload}")
-        except queue.Empty:
-            pass
-        self.after(100, self._poll_queue)
-
 
 def main():
     app = TranslatorGUI()

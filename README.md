@@ -23,6 +23,8 @@
 
 GUI 默认以简体中文显示。顶部“当前功能 ▾”菜单提供“获取小说”“翻译小说”“检查译文”三个入口；获取小说页可切换网络下载和本地导入，翻译页可进入术语管理。选中作品后顶部中间显示书名，右侧设置可调整模型、Ollama 地址和主题；运行日志可从底部状态栏展开。在支持的 Windows 版本上，窗口标题栏也会随主题切换。新建翻译任务默认勾选简体中文。已有 `config.json` 中的 `target_language` 设置仍用于 CLI 和相关项目流程，可按需自行修改。
 
+`config.example.json` 提供默认设置；首次启动会生成 `config.json`。应用会补齐旧配置缺少的字段并检查常用数值和连接地址。GUI 与 CLI 保存设置时只更新改动的字段，保留其他设置和相对路径。
+
 网页模式默认使用已安装的 Microsoft Edge，也可选择 Chrome、自定义 Chromium 或 Playwright Chromium。仅首次选择尚未安装的 Playwright Chromium 时下载浏览器；只翻译本地 EPUB 不需要下载浏览器。
 
 CLI 在模型缺失时可询问是否下载；GUI 请先用上述命令安装模型。
@@ -83,14 +85,14 @@ CLI 菜单 8 可打开 GUI。
 
 ## 翻译模型、完整性与中止
 
-提供两个模型：
+内置以下两个推荐模型。GUI 设置页可读取当前 Ollama 地址上的已安装模型，也可手动填写其他模型名称；翻译页会使用所选模型。模型必须已安装在对应 Ollama 服务中。
 
 | 选项 | Ollama 模型名 |
 |---|---|
 | Hy-MT2 7B Q4_K_M（默认） | `hf.co/tencent/Hy-MT2-7B-GGUF:Q4_K_M` |
 | Hy-MT2 7B Q6_K | `hf.co/tencent/Hy-MT2-7B-GGUF:Q6_K` |
 
-来源：[腾讯官方 GGUF 仓库](https://huggingface.co/tencent/Hy-MT2-7B-GGUF)。旧配置中的其他模型在加载时改用 Q4_K_M；旧翻译模式和校对设置不再生效，已有译文保留。
+来源：[腾讯官方 GGUF 仓库](https://huggingface.co/tencent/Hy-MT2-7B-GGUF)。未设置模型时默认使用 Q4_K_M；旧翻译模式和校对设置不再生效，已有译文保留。
 
 翻译使用简短指令和纯文本输出，不要求 JSON，也不进行二次校对。多段原文以空行分隔；返回段落数不匹配时拆分重试。术语表和前文仅在有内容时加入参考。
 

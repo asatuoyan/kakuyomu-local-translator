@@ -1,6 +1,7 @@
 {
   "ollama_url": "http://127.0.0.1:11434",
   "model": "hf.co/tencent/Hy-MT2-7B-GGUF:Q4_K_M",
+  "ui_theme": "light",
   "target_language": "简体中文",
   "output_dir": "output",
   "browser_profile_dir": "browser-profile",
