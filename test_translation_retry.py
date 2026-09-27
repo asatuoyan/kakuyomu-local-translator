@@ -30,13 +30,6 @@ class TranslationRetryTests(unittest.TestCase):
             self.assertEqual(main.translate_episode(self.episode, self.cfg, folder), ["譯一", "譯二"])
             chunk.assert_not_called()
 
-    def test_review_retries_invalid_model_output(self):
-        with TemporaryDirectory() as temporary, patch("main.review_chunk") as chunk:
-            chunk.side_effect = [RuntimeError("無效 JSON"), ["校一", "校二"]]
-            self.assertEqual(main.proofread_episode(
-                self.episode, ["譯一", "譯二"], self.cfg, Path(temporary)
-            ), ["校一", "校二"])
-            self.assertEqual(chunk.call_count, 2)
 
     def test_exhaustion_keeps_successful_batch_for_resume(self):
         with TemporaryDirectory() as temporary, patch("main.translate_chunk") as chunk:

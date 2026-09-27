@@ -74,9 +74,9 @@ class TranslationBatchTests(unittest.TestCase):
     @patch("main.ollama_chat_content")
     def test_incomplete_translation_is_retried_in_smaller_batches(self, chat):
         chat.side_effect = [
-            '{"translations":["譯一","譯二","譯三"]}',
-            '{"translations":["譯一","譯二"]}',
-            '{"translations":["譯三","譯四"]}',
+            '譯一\n\n譯二\n\n譯三',
+            '譯一\n\n譯二',
+            '譯三\n\n譯四',
         ]
 
         result = main.translate_chunk(["一", "二", "三", "四"], self.cfg)
@@ -88,27 +88,27 @@ class TranslationBatchTests(unittest.TestCase):
     def test_token_repeat_error_splits_translation_batch(self, chat):
         chat.side_effect = [
             RuntimeError("Ollama 生成失敗：prediction aborted, token repeat limit reached"),
-            '{"translations":["譯一","譯二"]}',
-            '{"translations":["譯三","譯四"]}',
+            '譯一\n\n譯二',
+            '譯三\n\n譯四',
         ]
 
         result = main.translate_chunk(["一", "二", "三", "四"], self.cfg)
 
         self.assertEqual(result, ["譯一", "譯二", "譯三", "譯四"])
         self.assertEqual(chat.call_count, 3)
-        self.assertIn("譯一", chat.call_args_list[2].args[0]["messages"][1]["content"])
+        self.assertIn("譯一", chat.call_args_list[2].args[0]["messages"][0]["content"])
 
     @patch("main.ollama_chat_content")
     def test_token_repeat_error_retries_single_paragraph_once(self, chat):
         chat.side_effect = [
             RuntimeError("Ollama 生成失敗：prediction aborted, token repeat limit reached"),
-            '{"translations":["譯一"]}',
+            '譯一',
         ]
 
         self.assertEqual(main.translate_chunk(["一"], self.cfg, "先前譯文"), ["譯一"])
         self.assertEqual(chat.call_count, 2)
         self.assertGreater(chat.call_args.args[0]["options"]["temperature"], 0.2)
-        self.assertNotIn("先前譯文", chat.call_args.args[0]["messages"][1]["content"])
+        self.assertNotIn("先前譯文", chat.call_args.args[0]["messages"][0]["content"])
 
     @patch("main.ollama_chat_content")
     def test_repeated_single_paragraph_error_is_not_retried_forever(self, chat):
@@ -128,35 +128,7 @@ class TranslationBatchTests(unittest.TestCase):
 
         self.assertEqual(chat.call_count, 1)
 
-    @patch("main.ollama_chat_content")
-    def test_token_repeat_error_splits_review_batch(self, chat):
-        self.cfg["review_model"] = "test-review"
-        chat.side_effect = [
-            RuntimeError("Ollama 生成失敗：prediction aborted, token repeat limit reached"),
-            '{"translations":["校一"]}',
-            '{"translations":["校二"]}',
-        ]
 
-        result = main.review_chunk([("一", "譯一"), ("二", "譯二")], self.cfg, "前文")
-
-        self.assertEqual(result, ["校一", "校二"])
-        self.assertEqual(chat.call_count, 3)
-        self.assertIn("校一", chat.call_args.args[0]["messages"][1]["content"])
-
-    @patch("main.ollama_chat_content")
-    def test_review_single_paragraph_retries_once_without_context(self, chat):
-        self.cfg["review_model"] = "test-review"
-        chat.side_effect = [
-            RuntimeError("Ollama 生成失敗：prediction aborted, token repeat limit reached"),
-            '{"translations":["校一"]}',
-        ]
-
-        result = main.review_chunk([("一", "譯一")], self.cfg, "先前終稿")
-
-        self.assertEqual(result, ["校一"])
-        self.assertEqual(chat.call_count, 2)
-        self.assertGreater(chat.call_args.args[0]["options"]["temperature"], 0.15)
-        self.assertNotIn("先前終稿", chat.call_args.args[0]["messages"][1]["content"])
 
 
 class ModelCheckTests(unittest.TestCase):

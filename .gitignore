@@ -20,6 +20,10 @@ last-project.json
 # Browser automation profiles & caches
 browser-profile/
 browser-profile-msedge/
+browser-profile-*/
+translation-cache*.sqlite3*
+translation-cache.json
+source-cache.json
 
 # IDE & Editor
 .idea/

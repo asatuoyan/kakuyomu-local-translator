@@ -78,7 +78,7 @@ from main import (
     load_config,
     load_json,
     atomic_json,
-    proofread_episode,
+    TRANSLATION_MODELS,
     safe_name,
     select_active_page,
     translate_episode,
@@ -86,7 +86,8 @@ from main import (
 from playwright.sync_api import sync_playwright
 from epub_append import build_extended_epub, create_project_from_epub, inspect_epub
 from languages import LANGUAGES, language_name
-from main import translate_epub_language
+from main import (translate_epub_language, load_review_project, MissingProjectSource,
+                  audit_project, project_glossary, retranslate_project)
 
 
 # Based on the supplied color guide, with a softer, higher-contrast light theme.
@@ -306,6 +307,8 @@ class TranslatorGUI(tk.Tk):
         self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.log_toggle = ttk.Button(status_row, text="顯示日誌", command=self._toggle_log)
         self.log_toggle.pack(side=tk.RIGHT)
+        self.btn_stop = ttk.Button(status_row, text="中止翻译", command=self._action_stop, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.RIGHT, padx=6)
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_bar = ttk.Progressbar(footer, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=(8, 0))
@@ -1401,7 +1404,7 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_translate
 
         # Source Selection
-        ttk.Label(f, text="選擇原文與翻譯模式，即可開始。已完成的進度會自動接續。",
+        ttk.Label(f, text="選擇原文與翻譯模型，即可開始。已完成的進度會自動接續。",
                   style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 12))
         src_frame = ttk.LabelFrame(f, text="1 · 選擇日文 EPUB", padding=14)
         src_frame.pack(fill=tk.X, pady=(0, 8))
@@ -1415,7 +1418,7 @@ class TranslatorGUI(tk.Tk):
         ttk.Button(src_frame, text="選擇 EPUB...", command=self._action_select_tr_epub).grid(row=0, column=2, padx=4, pady=4)
 
         # Target Language & Translation Mode
-        opt_frame = ttk.LabelFrame(f, text="2 · 選擇輸出語言與模式", padding=14)
+        opt_frame = ttk.LabelFrame(f, text="2 · 選擇輸出語言與模型", padding=14)
         opt_frame.pack(fill=tk.X, pady=(4, 8))
         language_row = ttk.Frame(opt_frame)
         language_row.pack(fill=tk.X, pady=(0, 12))
@@ -1429,23 +1432,10 @@ class TranslatorGUI(tk.Tk):
         ttk.Label(opt_frame, text="可多選，每種語言獨立輸出；中文標題與正文會自動統一簡繁。",
                   style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 8))
 
-        self.tr_mode_var = tk.StringVar(value="custom")
-        custom_model = self.cfg.get("custom_model", self.cfg.get("model", ""))
-        modes = ttk.Frame(opt_frame)
-        modes.pack(fill=tk.X)
-        modes.columnconfigure(1, weight=1)
-        for row, (value, title, description) in enumerate([
-            ("custom", "自訂模型", custom_model or "使用設定檔中的模型"),
-            ("fast", "快速", "Qwen3 8B · 適合優先追求速度"),
-            ("quality", "品質", "Qwen3 14B · 翻譯較慢，記憶體需求較高"),
-            ("hybrid", "翻譯＋校對", "8B 初譯，再由 14B 校對"),
-        ]):
-            ttk.Radiobutton(modes, text=title, variable=self.tr_mode_var, value=value).grid(
-                row=row, column=0, sticky=tk.W, padx=(0, 20), pady=7)
-            description_label = ttk.Label(modes, text=description, style="Muted.TLabel", wraplength=550)
-            description_label.grid(row=row, column=1, sticky=tk.EW, pady=7)
-            description_label.bind("<Configure>", lambda event: event.widget.configure(
-                wraplength=max(100, event.width)))
+        self.tr_model_var = tk.StringVar(value=self.cfg["model"])
+        for label, model in TRANSLATION_MODELS.items():
+            ttk.Radiobutton(opt_frame, text=label, variable=self.tr_model_var,
+                            value=model).pack(anchor=tk.W, pady=7)
 
         # Progress / action buttons
         btn_box = ttk.Frame(f)
@@ -1453,9 +1443,6 @@ class TranslatorGUI(tk.Tk):
 
         self.btn_start_tr = ttk.Button(btn_box, text="開始翻譯", style="Accent.TButton", command=self._action_start_translate)
         self.btn_start_tr.pack(side=tk.RIGHT, padx=4)
-
-        self.btn_stop = ttk.Button(btn_box, text=" 中止 ", command=self._action_stop, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.RIGHT, padx=4)
 
     def _action_select_tr_epub(self):
         fpath = filedialog.askopenfilename(
@@ -1480,26 +1467,7 @@ class TranslatorGUI(tk.Tk):
         if not languages:
             messagebox.showwarning("提示", "請至少選擇一種輸出語言。")
             return
-        mode_val = self.tr_mode_var.get()
-
-        # Update model profile
-        if mode_val == "fast":
-            self.cfg["profile"] = "快速"
-            self.cfg["model"] = "qwen3:8b"
-            self.cfg["dual_stage"] = False
-        elif mode_val == "quality":
-            self.cfg["profile"] = "質量"
-            self.cfg["model"] = "qwen3:14b"
-            self.cfg["dual_stage"] = False
-        elif mode_val == "hybrid":
-            self.cfg["profile"] = "混合"
-            self.cfg["model"] = "qwen3:8b"
-            self.cfg["review_model"] = "qwen3:14b"
-            self.cfg["dual_stage"] = True
-        else:
-            self.cfg["profile"] = "自訂"
-            self.cfg["model"] = self.cfg.get("custom_model", self.cfg["model"])
-            self.cfg["dual_stage"] = False
+        self.cfg["model"] = self.tr_model_var.get()
 
         task_cfg = dict(self.cfg)
         task_cfg["_translation_cancelled"] = lambda: self.stop_requested
@@ -1512,8 +1480,6 @@ class TranslatorGUI(tk.Tk):
             failures = []
             try:
                 ensure_model(task_cfg, interactive=False)
-                if task_cfg.get("dual_stage"):
-                    ensure_model(task_cfg, task_cfg["review_model"], interactive=False)
                 for language_index, code in enumerate(languages):
                     if self.stop_requested:
                         raise TranslationCancelled()
@@ -1564,10 +1530,10 @@ class TranslatorGUI(tk.Tk):
         top_f.columnconfigure(1, weight=1)
 
         ttk.Button(top_f, text="選擇專案...", command=self._action_select_audit_proj).grid(row=0, column=2, padx=4, pady=4)
-        ttk.Button(top_f, text="一鍵檢查譯文合規性", command=self._action_audit_compliance).grid(row=0, column=3, padx=4, pady=4)
+        ttk.Button(top_f, text="檢查術語與譯文", command=self._action_audit_compliance).grid(row=0, column=3, padx=4, pady=4)
 
         # Violations Table
-        lbl_v = ttk.Label(f, text="術語合規警示清單（日文原文有出現但中文譯文未落實）：", font=("Microsoft JhengHei UI", 11, "bold"))
+        lbl_v = ttk.Label(f, text="術語與譯文警示（請人工核對）：", font=("Microsoft JhengHei UI", 11, "bold"))
         lbl_v.pack(anchor=tk.W, pady=(4, 2))
 
         v_frame = ttk.Frame(f)
@@ -1613,134 +1579,103 @@ class TranslatorGUI(tk.Tk):
         if fpath:
             self.audit_proj_var.set(fpath)
 
+    def _load_review_project(self, path):
+        try:
+            return load_review_project(path)
+        except MissingProjectSource:
+            source = filedialog.askopenfilename(title="选择创建旧项目时的原始 EPUB", filetypes=[("EPUB", "*.epub")])
+            if not source:
+                return None
+            return load_review_project(path, Path(source))
+
     def _action_audit_compliance(self):
-        p_str = self.audit_proj_var.get().strip()
-        if not p_str or not Path(p_str).exists():
-            messagebox.showwarning("提示", "請先選擇作品專案資料夾。")
+        path = Path(self.audit_proj_var.get().strip())
+        try:
+            project = self._load_review_project(path)
+            if project is None:
+                return
+            entries = project_glossary(self.cfg, path, project)
+        except Exception as exc:
+            messagebox.showerror("项目错误", str(exc))
             return
-
-        p = Path(p_str)
-        proj_file = p / "project.json"
-        if not proj_file.exists():
-            messagebox.showerror("錯誤", "專案中找不到 project.json。")
-            return
-
-        self._set_busy(True, "正在審���專案譯文術語合規性……")
+        self._set_busy(True, "正在稽核术语……")
         for item in self.violation_tree.get_children():
             self.violation_tree.delete(item)
 
         def _worker():
             try:
-                project = load_json(proj_file, {})
-                eff_entries = get_effective_glossary(self.cfg, p)
-                total_v = 0
-                for ch in project.get("chapters", []):
-                    ch_title = ch.get("title", "")
-                    ja = ch.get("japanese", []) or ch.get("source_paragraphs", [])
-                    zh = ch.get("translation", []) or ch.get("paragraphs", [])
-                    if ja and zh:
-                        violations, _ = check_glossary_compliance(ja, zh, eff_entries)
-                        for v in violations:
-                            total_v += 1
-                            self.log_queue.put(("violation", (ch_title, v)))
-                self.log_queue.put(("audit_complete", total_v))
+                results = audit_project(project, entries)
+                for title, violation in results:
+                    self.log_queue.put(("violation", (title, violation)))
+                self.log_queue.put(("audit_complete", len(results)))
             except Exception as exc:
-                self.log_queue.put(("error", f"合規審查失敗：{exc}"))
-
+                self.log_queue.put(("error", f"稽核失败：{exc}"))
         threading.Thread(target=_worker, daemon=True).start()
 
     def _action_scope_retranslate_gui(self):
-        p_str = self.audit_proj_var.get().strip()
-        if not p_str or not Path(p_str).exists():
-            messagebox.showwarning("提示", "請先選擇作品專案資料夾。")
+        path = Path(self.audit_proj_var.get().strip())
+        value = self.re_terms_var.get().strip()
+        if not value:
+            messagebox.showwarning("提示", "请输入需要重译的原文术语。")
             return
-        p = Path(p_str)
-        proj_file = p / "project.json"
-        if not proj_file.exists():
-            messagebox.showerror("錯誤", "專案中找不到 project.json。")
+        try:
+            project = self._load_review_project(path)
+            if project is None:
+                return
+            entries = project_glossary(self.cfg, path, project)
+            terms = list(entries_to_dict(entries)) if value.lower() == "all" else [t for t in re.split(r"[,，、\s]+", value) if t]
+            affected = find_affected_chapters(project.get("chapters", []), terms)
+        except Exception as exc:
+            messagebox.showerror("项目错误", str(exc))
             return
-
-        terms_str = self.re_terms_var.get().strip()
-        if not terms_str:
-            messagebox.showwarning("提示", "請輸入需要局部重譯的日文術語。")
-            return
-
-        project = load_json(proj_file, {})
-        chapters = project.get("chapters", [])
-        eff_entries = get_effective_glossary(self.cfg, p)
-        eff_dict = entries_to_dict(eff_entries)
-
-        if terms_str.lower() == "all":
-            query_terms = list(eff_dict.keys())
-        else:
-            query_terms = [t.strip() for t in re.split(r"[,，、\s]+", terms_str) if t.strip()]
-
-        affected = find_affected_chapters(chapters, query_terms)
         if not affected:
-            messagebox.showinfo("無受影響章節", "專案中未找到包含指定術語的章節段落，無須重譯。")
+            messagebox.showinfo("提示", "没有受影响的段落。")
             return
-
-        total_paras = sum(len(a["affected_paragraphs"]) for a in affected)
-        msg = f"分析結果：共 {len(affected)} / {len(chapters)} 個章節（{total_paras} 個段落）受影響。\n\n是否立即執行局部重譯並更新 EPUB？"
-        if not messagebox.askyesno("確認局部重譯", msg):
+        count = sum(len(item["affected_paragraphs"]) for item in affected)
+        if not messagebox.askyesno("局部重译", f"将重译 {len(affected)} 章中的 {count} 个段落并更新 EPUB，继续？"):
             return
+        self.stop_requested = False
+        task_cfg = dict(self.cfg)
+        task_cfg["_translation_cancelled"] = lambda: self.stop_requested
+        self._set_busy(True, "正在局部重译……")
+        self.btn_stop.config(state=tk.NORMAL)
 
-        self._set_busy(True, f"正在對 {len(affected)} 個受影響章節進行局部重譯……")
+        def progress(percent, title):
+            self.log_queue.put(("progress", percent))
+            self.log_queue.put(("status", title))
 
         def _worker():
             try:
-                ensure_model(self.cfg, interactive=False)
-                if self.cfg.get("dual_stage"):
-                    ensure_model(self.cfg, self.cfg["review_model"], interactive=False)
-
-                ch_cfg = dict(self.cfg)
-                ch_cfg["target_language"] = project.get("language", self.cfg.get("target_language", "繁體中文"))
-                ch_cfg["glossary"] = eff_dict
-
-                for idx, item in enumerate(affected, 1):
-                    ch_idx = item["index"] - 1
-                    ch_rec = chapters[ch_idx]
-                    title = ch_rec.get("title", f"第 {item['index']} 章")
-
-                    pct = (idx / len(affected)) * 100
-                    self.log_queue.put(("progress", pct))
-                    self.log_queue.put(("log", f"[局部重譯 {idx}/{len(affected)}] {title}\n"))
-
-                    ja_paras = ch_rec.get("japanese", []) or ch_rec.get("source_paragraphs", [])
-                    if not ja_paras:
-                        continue
-
-                    blocks = ch_rec.get("blocks", [])
-                    ep_blocks = []
-                    for b in blocks:
-                        if b.get("type") == "image":
-                            ep_blocks.append({"type": "image", "url": b.get("key", ""), "alt": b.get("alt", "")})
-                        else:
-                            ep_blocks.append({"type": "text", "text": ""})
-
-                    ep = Episode(url=ch_rec.get("url", f"ch_{item['index']}"), work_title="",
-                                 episode_title=title, paragraphs=ja_paras, blocks=ep_blocks)
-
-                    drafts = translate_episode(ep, ch_cfg, p)
-                    translations = proofread_episode(ep, drafts, ch_cfg, p) if ch_cfg.get("dual_stage") else drafts
-
-                    images = ch_rec.get("images", [])
-                    add_or_update_project(ep, translations, p, ch_cfg, images,
-                                          drafts=drafts if ch_cfg.get("dual_stage") else None, build_now=False)
-
-                rebuilt = load_json(proj_file, {})
-                out_epub = build_extended_epub(rebuilt, p)
-                self.log_queue.put(("progress", 100.0))
-                self.log_queue.put(("retranslate_complete", str(out_epub)))
+                ensure_model(task_cfg, interactive=False)
+                output = retranslate_project(path, task_cfg, terms, progress)
+                self.log_queue.put(("retranslate_complete", str(output)))
+            except TranslationCancelled:
+                self.log_queue.put(("log", "已停止。已完成章节已保存；再次局部重译会更新 EPUB。\n"))
+                self.log_queue.put(("translate_stopped", None))
             except Exception as exc:
-                self.log_queue.put(("error", f"局部重譯失敗：{exc}"))
-
+                self.log_queue.put(("error", f"局部重译失败：{exc}"))
         threading.Thread(target=_worker, daemon=True).start()
 
     # ==========================================
     # Global State & Helpers
     # ==========================================
     def _set_busy(self, busy: bool, status_msg: str = ""):
+        if busy:
+            self._busy_button_states = []
+
+            def disable(parent):
+                for widget in parent.winfo_children():
+                    if isinstance(widget, (ttk.Button, tk.Button)) and widget not in (self.log_toggle, self.theme_button):
+                        self._busy_button_states.append((widget, str(widget.cget("state"))))
+                        widget.configure(state=tk.DISABLED)
+                    disable(widget)
+
+            disable(self)
+        else:
+            for widget, state in getattr(self, "_busy_button_states", []):
+                if widget.winfo_exists():
+                    widget.configure(state=state)
+            self._busy_button_states = []
         if busy:
             self.status_var.set(status_msg)
             self.progress_var.set(0.0)
@@ -1814,9 +1749,9 @@ class TranslatorGUI(tk.Tk):
                     self._set_busy(False)
                     total_v = payload
                     if total_v == 0:
-                        messagebox.showinfo("合規審查結果", "專案中所有章節皆符合術語表規範，未發現違規！")
+                        messagebox.showinfo("譯文檢查結果", "未發現術語或譯文警示。")
                     else:
-                        messagebox.showwarning("合規審查結果", f"審查完成，共發現 {total_v} 處術語合規警示。")
+                        messagebox.showwarning("譯文檢查結果", f"檢查完成，共發現 {total_v} 處警示，請人工核對。")
                 elif msg_type == "retranslate_complete":
                     self._set_busy(False)
                     self.log_text.insert(tk.END, f"局部重譯完成！EPUB 已更新：{payload}\n")

@@ -4,15 +4,16 @@ import hashlib
 import html
 import json
 import mimetypes
+import posixpath
 import random
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag, Comment
 from ebooklib import epub
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page
 
@@ -538,7 +539,15 @@ def extract_epub_chapters(source: Path, assets_dir: Path) -> tuple[dict[str, Any
     }
     assets_dir.mkdir(parents=True, exist_ok=True)
     cover_items = list(book.get_items_of_type(10)) + list(book.get_items_of_type(1))
-    cover_item = next((item for item in cover_items if "cover" in item.get_name().lower()), None)
+    try:
+        cover_metadata = book.get_metadata("OPF", "cover")
+    except KeyError:
+        cover_metadata = []
+    cover_id = next((attrs.get("content") for _, attrs in cover_metadata), None)
+    cover_item = book.get_item_with_id(cover_id) if cover_id else None
+    cover_item = cover_item or next((item for item in cover_items
+                                    if "cover-image" in getattr(item, "properties", [])), None)
+    cover_item = cover_item or next((item for item in cover_items if "cover" in item.get_name().lower()), None)
     if cover_item is not None:
         cover_path = assets_dir / ("cover" + (Path(cover_item.get_name()).suffix or ".jpg"))
         cover_path.write_bytes(cover_item.get_content())
@@ -548,7 +557,7 @@ def extract_epub_chapters(source: Path, assets_dir: Path) -> tuple[dict[str, Any
     image_items = {item.get_name(): item for item in book.get_items_of_type(1)}
     for idref, _linear in book.spine:
         item = book.get_item_with_id(idref)
-        if item is None or item.get_type() != 9 or idref in {"nav", "introduction", "cover"}:
+        if item is None or item.get_type() != 9 or idref in {"nav", "introduction", "cover"} or "nav" in getattr(item, "properties", []):
             continue
         content_bytes = item.get_content()
         soup = BeautifulSoup(content_bytes.decode("utf-8", errors="replace"), "html.parser")
@@ -557,26 +566,59 @@ def extract_epub_chapters(source: Path, assets_dir: Path) -> tuple[dict[str, Any
         blocks: list[dict[str, str]] = []
         paragraphs: list[str] = []
         images: list[dict[str, Any]] = []
-        for node in soup.select("p, img"):
-            if node.name == "p" and node.find("img"):
-                continue
-            if node.name == "p":
-                value = _clean(node.get_text(" ", strip=True))
-                if value:
-                    paragraphs.append(value); blocks.append({"type": "text", "text": value})
-            elif node.name == "img" and node.get("src"):
-                candidates = [k for k in image_items if k.endswith(Path(node["src"]).name)]
-                if not candidates:
-                    continue
-                image_item = image_items[candidates[0]]
-                key = "epub://" + image_item.get_name()
-                local = assets_dir / Path(image_item.get_name()).name
-                if not local.exists():
-                    local.write_bytes(image_item.get_content())
+        pending: list[str] = []
+        image_keys: set[str] = set()
+
+        def flush():
+            value = _clean("".join(pending))
+            pending.clear()
+            if value:
+                paragraphs.append(value)
+                blocks.append({"type": "text", "text": value})
+
+        def walk(node):
+            if isinstance(node, Comment):
+                return
+            if isinstance(node, NavigableString):
+                pending.append(str(node))
+                return
+            if not isinstance(node, Tag) or node is title or node.name in {"script", "style", "rt", "rp", "head"}:
+                return
+            if node.name in {"img", "image"}:
+                flush()
+                ref = node.get("src") or node.get("href") or node.get("xlink:href", "")
+                parsed = urlparse(ref)
+                if parsed.scheme or parsed.netloc or not parsed.path:
+                    return
+                resource = posixpath.normpath(posixpath.join(posixpath.dirname(item.get_name()), unquote(parsed.path)))
+                image_item = image_items.get(resource)
+                if image_item is None:
+                    raise ValueError(f"EPUB 图片资源缺失：{item.get_name()} → {ref}")
+                # Keep relative resource paths locally; use a unique export name.
+                local = assets_dir / resource
+                if not local.resolve().is_relative_to(assets_dir.resolve()):
+                    raise ValueError(f"EPUB 图片路径超出资源目录：{resource}")
+                local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_bytes(image_item.get_content())
+                key = "epub://" + resource
                 blocks.append({"type": "image", "url": key, "alt": node.get("alt", "")})
-                images.append({"key": key, "local_path": str(local),
-                               "media_type": image_item.media_type, "alt": node.get("alt", "")})
-        if paragraphs:
+                if key not in image_keys:
+                    images.append({"key": key, "local_path": str(local.resolve()),
+                                   "name": hashlib.sha256(resource.encode()).hexdigest()[:24] + Path(resource).suffix,
+                                   "media_type": image_item.media_type, "alt": node.get("alt", "")})
+                    image_keys.add(key)
+                return
+            boundary = node.name in {"p", "div", "section", "article", "blockquote", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "tr", "td", "th", "figure", "figcaption", "br", "hr"}
+            if boundary:
+                flush()
+            for child in node.children:
+                walk(child)
+            if boundary:
+                flush()
+
+        walk(soup.body or soup)
+        flush()
+        if blocks:
             chapters.append(SourceChapter(url=f"epub://{idref}", title=chapter_title,
                                           paragraphs=paragraphs, blocks=blocks, images=images))
     if not chapters:
@@ -596,6 +638,7 @@ def translated_source_epub(metadata: dict[str, Any], chapters: list[SourceChapte
             metadata[key] = normalize_output(metadata[key], language)
     chapters = [replace(chapter, title=normalize_output(chapter.title, language),
                         paragraphs=[normalize_output(text, language) for text in chapter.paragraphs],
+                        images=[dict(image) for image in chapter.images],
                         blocks=[{**block, **{key: normalize_output(block[key], language)
                                              for key in ("text", "alt") if key in block}}
                                 for block in chapter.blocks]) for chapter in chapters]
@@ -606,7 +649,7 @@ def translated_source_epub(metadata: dict[str, Any], chapters: list[SourceChapte
         for image in chapter.images:
             if "data" not in image and image.get("local_path"):
                 image["data"] = Path(image["local_path"]).read_bytes()
-                image["name"] = Path(image["local_path"]).name
+                image.setdefault("name", Path(image["local_path"]).name)
     cover = None
     if metadata.get("cover_path") and Path(metadata["cover_path"]).exists():
         cover = (Path(metadata["cover_path"]).read_bytes(), metadata.get("cover_media_type", "image/jpeg"))

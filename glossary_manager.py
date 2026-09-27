@@ -517,7 +517,7 @@ def find_affected_chapters(
         if isinstance(ch, dict):
             title = ch.get("title", f"第 {idx} 章")
             url = ch.get("url", "")
-            paras = ch.get("japanese", []) or ch.get("paragraphs", []) or ch.get("source_paragraphs", [])
+            paras = ch.get("source_paragraphs", []) or ch.get("japanese", []) or ch.get("paragraphs", [])
         else:
             title = getattr(ch, "title", f"第 {idx} 章")
             url = getattr(ch, "url", "")
@@ -662,7 +662,7 @@ def check_glossary_compliance(
 
     active_entries = [
         e for e in entries
-        if e.source and e.target and not e.source.startswith("例：") and len(e.source) >= 2
+        if e.source and e.target and not e.source.startswith("例：")
     ]
     # Sort by source length descending so longer compound terms match first
     active_entries.sort(key=lambda x: len(x.source), reverse=True)

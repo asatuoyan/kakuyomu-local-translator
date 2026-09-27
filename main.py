@@ -3,15 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import queue
 import re
 import sys
+import subprocess
 import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from project_storage import (TranslationCache, atomic_json, load_json,
+                             load_translation_state, save_translation_state)
+from quality_checks import check_translation_quality
 from languages import LANGUAGES, language_code, language_name, language_suffix, normalize_output, output_glossary
 import random
 from playwright.sync_api import BrowserContext, Page, sync_playwright
@@ -57,6 +63,11 @@ from text_importer import (
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
+TRANSLATION_MODELS = {
+    "Hy-MT2 7B Q6_K": "hf.co/tencent/Hy-MT2-7B-GGUF:Q6_K",
+    "Hy-MT2 7B Q4_K_M": "hf.co/tencent/Hy-MT2-7B-GGUF:Q4_K_M",
+}
+DEFAULT_MODEL = TRANSLATION_MODELS["Hy-MT2 7B Q4_K_M"]
 
 
 @dataclass
@@ -104,6 +115,8 @@ def load_config() -> dict[str, Any]:
             encoding="utf-8",
         )
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if cfg.get("model") not in TRANSLATION_MODELS.values():
+        cfg["model"] = DEFAULT_MODEL
     cfg["output_dir"] = str((APP_DIR / cfg.get("output_dir", "output")).resolve())
     cfg["browser_profile_dir"] = str(
         (APP_DIR / cfg.get("browser_profile_dir", "browser-profile")).resolve()
@@ -282,59 +295,23 @@ def ensure_model(cfg: dict[str, Any], model: str | None = None, interactive: boo
 
 def select_model(cfg: dict[str, Any], allow_cancel: bool = False) -> bool:
     print("\n选择翻译模型：")
-    print("  1. 快速模式  qwen3:8b（较大分块，速度优先）")
-    print("  2. 质量模式  qwen3:14b（较小分块，更长前文语境）")
-    print("  3. 混合模式  8B 初译后立即由 14B 校对")
-    print(f"  4. 自定义模型  {cfg.get('custom_model', cfg.get('model', ''))}")
+    choices = list(TRANSLATION_MODELS.items())
+    for index, (label, _) in enumerate(choices, 1):
+        print(f"  {index}. {label}")
     if allow_cancel:
         print("  Enter. 保持当前模型")
     choice = input("请选择：").strip()
     if allow_cancel and not choice:
         return False
-    profiles = {
-        "1": {"model": "qwen3:8b", "translation_chunk_chars": 2800, "context_chars": 900, "profile": "快速", "dual_stage": False},
-        "2": {"model": "qwen3:14b", "translation_chunk_chars": 1400, "context_chars": 2600, "profile": "质量", "dual_stage": False},
-        "3": {"model": "qwen3:8b", "review_model": "qwen3:14b", "translation_chunk_chars": 2800, "context_chars": 900, "review_chunk_chars": 1400, "review_context_chars": 2600, "profile": "混合", "dual_stage": True},
-    }
-    if choice == "4":
-        current = cfg.get("custom_model", "")
-        model = input(f"输入 Ollama 模型名称 [{current}]：").strip() or current
-        if not model:
-            print("没有填写模型名称。")
-            return False
-        profile = {
-            "model": model,
-            "translation_chunk_chars": int(cfg.get("translation_chunk_chars", 2200)),
-            "context_chars": int(cfg.get("context_chars", 1200)),
-            "profile": "自定义",
-            "dual_stage": False,
-        }
-    elif choice in profiles:
-        profile = profiles[choice]
-    else:
+    if choice not in {str(i) for i in range(1, len(choices) + 1)}:
         print("无效选择。")
         return False
-    previous = {key: cfg.get(key) for key in profile}
-    cfg.update(profile)
-    try:
-        if not ensure_model(cfg):
-            cfg.update(previous)
-            return False
-        if cfg.get("dual_stage") and not ensure_model(cfg, cfg["review_model"]):
-            cfg.update(previous)
-            return False
-    except Exception:
-        cfg.update(previous)
-        raise
-    print(
-        f"当前：{cfg['profile']}模式 / {cfg['model']} / "
-        f"分块约 {cfg['translation_chunk_chars']} 字 / 前文 {cfg['context_chars']} 字"
-    )
-    if cfg.get("dual_stage"):
-        print(
-            f"校对：{cfg['review_model']} / 分块约 {cfg['review_chunk_chars']} 字 / "
-            f"前文终稿 {cfg['review_context_chars']} 字"
-        )
+    candidate = dict(cfg)
+    candidate["model"] = choices[int(choice) - 1][1]
+    if not ensure_model(candidate):
+        return False
+    cfg["model"] = candidate["model"]
+    print(f"当前模型：{cfg['model']}")
     return True
 
 
@@ -367,7 +344,7 @@ def report_and_check_compliance(
     return translations
 
 
-def ollama_chat_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
+def _read_ollama_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
     base = cfg["ollama_url"].rstrip("/")
     streamed_payload = dict(payload)
     streamed_payload["stream"] = True
@@ -381,46 +358,90 @@ def ollama_chat_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
         response.raise_for_status()
         content_parts: list[str] = []
         for raw in response.iter_lines():
+            check_translation_cancelled(cfg)
             if not raw:
                 continue
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
             try:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
                 event = json.loads(raw)
-            except (json.JSONDecodeError, TypeError) as exc:
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
                 raise RuntimeError(f"Ollama 回傳了無效資料：{str(raw)[:300]}") from exc
+            if not isinstance(event, dict):
+                raise RuntimeError("Ollama 返回了无效的响应对象。")
             if event.get("error"):
                 raise RuntimeError(f"Ollama 生成失敗：{event['error']}")
-            content_parts.append(str(event.get("message", {}).get("content", "")))
-        return "".join(content_parts)
+            message = event.get("message", {})
+            if not isinstance(message, dict) or not isinstance(message.get("content", ""), str):
+                raise RuntimeError("Ollama 返回了无效的消息内容。")
+            content_parts.append(message.get("content", ""))
+            if event.get("done") is True:
+                if event.get("done_reason") in {"length", "max_tokens"}:
+                    raise RuntimeError("Ollama 输出达到长度限制，译文未完成。")
+                return "".join(content_parts)
+        raise RuntimeError("Ollama 响应提前结束，未收到完成标记。")
     finally:
         response.close()
+
+
+def check_translation_cancelled(cfg: dict[str, Any]) -> None:
+    if cfg.get("_translation_cancelled", lambda: False)():
+        raise TranslationCancelled()
+
+
+def ollama_chat_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
+    check_translation_cancelled(cfg)
+    if "_translation_cancelled" not in cfg:
+        return _read_ollama_content(payload, cfg)
+    # The network worker owns the response and always closes it. Cancellation of
+    # the UI does not wait for a stalled socket, nor permit late data to be saved.
+    results = queue.Queue(maxsize=1)
+    abandoned = threading.Event()
+    request_cfg = dict(cfg)
+    request_cfg["_translation_cancelled"] = abandoned.is_set
+
+    def receive():
+        try:
+            results.put((True, _read_ollama_content(payload, request_cfg)))
+        except Exception as exc:
+            results.put((False, exc))
+
+    threading.Thread(target=receive, daemon=True).start()
+    try:
+        while True:
+            check_translation_cancelled(cfg)
+            try:
+                success, value = results.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            check_translation_cancelled(cfg)
+            if success:
+                return value
+            raise value
+    finally:
+        abandoned.set()
 
 
 def translate_chunk(
     paragraphs: list[str], cfg: dict[str, Any], previous_context: str = "",
     *, _repeat_retry: bool = False,
 ) -> list[str]:
-    numbered = "\n".join(f"[{i}] {p}" for i, p in enumerate(paragraphs, 1))
-    system = f"""你是專業日文小說譯者。把輸入翻譯成{cfg['target_language']}。
-規則：
-1. 保留敘事語氣、角色口吻、段落數及順序，不增刪、摘要或審查內容。
-2. 固有名詞保持一致，依目標語言的慣例翻譯或音譯。
-3. 引號、標點與擬聲詞使用目標語言的自然表達。
-4. 只回傳 JSON，格式為 {{"translations":["第一段", "第二段"]}}。
-5. translations 的元素數量必須與輸入段落完全相同。
-
-固定譯名表：
-{glossary_text(cfg)}"""
-    context_chars = int(cfg.get("context_chars", 1200))
-    user = f"前文語境（僅供參考，不要重譯）：\n{previous_context[-context_chars:]}\n\n待翻譯段落：\n{numbered}"
+    check_translation_cancelled(cfg)
+    if not paragraphs:
+        return []
+    references = []
+    if cfg.get("glossary"):
+        references.append(f"参考下面的翻译：\n{glossary_text(cfg)}")
+    context_chars = max(0, int(cfg.get("context_chars", 1200)))
+    if previous_context and context_chars:
+        references.append(f"前文背景（仅供参考，不要翻译）：\n{previous_context[-context_chars:]}")
+    instruction = f"将以下文本翻译为{language_name(cfg['target_language'])}，只输出翻译结果，不要额外解释。"
+    if len(paragraphs) > 1:
+        instruction += "保持段落数量和顺序，段落之间保留一个空行。"
+    user = "\n\n".join([*references, instruction, "\n\n".join(paragraphs)])
     payload = {
         "model": cfg["model"],
-        "format": "json",
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "messages": [{"role": "user", "content": user}],
         "options": {"temperature": max(0.5, float(cfg.get("temperature", 0.2))) if _repeat_retry else cfg.get("temperature", 0.2)},
     }
     try:
@@ -438,13 +459,12 @@ def translate_chunk(
             raise
         print("  模型遇到重複 token 限制，單段改用較高溫度重試一次……", flush=True)
         return translate_chunk(paragraphs, cfg, "", _repeat_retry=True)
-    try:
-        result = json.loads(content)
-        translations = result["translations"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RuntimeError(f"模型沒有回傳有效 JSON：{content[:300]}") from exc
-    if not isinstance(translations, list) or len(translations) != len(paragraphs):
-        returned_count = len(translations) if isinstance(translations, list) else 0
+    content = normalize_text(content)
+    if not content:
+        raise RuntimeError("模型没有返回译文。")
+    translations = [content] if len(paragraphs) == 1 else re.split(r"\n\s*\n", content)
+    if len(translations) != len(paragraphs):
+        returned_count = len(translations)
         if len(paragraphs) > 1:
             midpoint = len(paragraphs) // 2
             print(
@@ -479,18 +499,6 @@ def make_batches(
     if current:
         batches.append(current)
     return batches
-
-
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def atomic_json(path: Path, value: Any) -> None:
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
 
 
 class TranslationCancelled(Exception):
@@ -539,22 +547,30 @@ def run_translation_batch(operation, cfg: dict[str, Any], label: str):
 
 
 def translate_episode(episode: Episode, cfg: dict[str, Any], work_dir: Path) -> list[str]:
-    cache_path = work_dir / "translation-cache.json"
-    cache: dict[str, str] = load_json(cache_path, {})
+    with TranslationCache(work_dir) as cache:
+        return _translate_episode(episode, cfg, cache)
+
+
+def _translate_episode(episode: Episode, cfg: dict[str, Any], cache: TranslationCache) -> list[str]:
+    check_translation_cancelled(cfg)
     translated: list[str] = []
     missing: list[str] = []
     positions: list[int] = []
     keys: list[str] = []
+    chapter_hash = compute_content_hash(episode.paragraphs)
     for i, paragraph in enumerate(episode.paragraphs):
         key_source = json.dumps(
-            [cfg["model"], cfg["target_language"], cfg.get("glossary", {}), paragraph],
+            [2, cfg["model"], cfg["target_language"], cfg.get("glossary", {}),
+             cfg.get("temperature", 0.2), cfg.get("context_chars", 1200),
+             episode.url, chapter_hash, i, paragraph],
             ensure_ascii=False,
             sort_keys=True,
         )
         key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
         keys.append(key)
-        if key in cache:
-            translated.append(cache[key])
+        cached = cache.get(key)
+        if cached is not None and not cfg.get("_force_retranslate"):
+            translated.append(cached)
         else:
             translated.append("")
             missing.append(paragraph)
@@ -574,145 +590,19 @@ def translate_episode(episode: Episode, cfg: dict[str, Any], work_dir: Path) -> 
             result = run_translation_batch(
                 lambda: translate_chunk(batch, cfg, context), cfg, "翻譯"
             )
+            check_translation_cancelled(cfg)
+            updates = []
             for source, target in zip(batch, result):
                 pos = positions[cursor]
                 translated[pos] = target
-                cache[keys[pos]] = target
+                updates.append((keys[pos], target))
                 cursor += 1
-            atomic_json(cache_path, cache)
+            cache.save(updates)
     else:
         print("本章已命中本機翻譯快取。")
     if cfg.get("check_glossary", True):
         translated = report_and_check_compliance(episode, translated, cfg, label="初譯")
     return [normalize_output(value, cfg["target_language"]) for value in translated]
-
-
-def make_review_batches(
-    originals: list[str], drafts: list[str], limit: int
-) -> list[list[tuple[str, str]]]:
-    batches: list[list[tuple[str, str]]] = []
-    current: list[tuple[str, str]] = []
-    size = 0
-    for original, draft in zip(originals, drafts):
-        pair_size = len(original) + len(draft)
-        if current and size + pair_size > limit:
-            batches.append(current)
-            current, size = [], 0
-        current.append((original, draft))
-        size += pair_size
-    if current:
-        batches.append(current)
-    return batches
-
-
-def review_chunk(
-    pairs: list[tuple[str, str]], cfg: dict[str, Any], previous_final: str,
-    *, _repeat_retry: bool = False,
-) -> list[str]:
-    items = "\n".join(
-        f"[{index}]\n日文：{original}\n初译：{draft}"
-        for index, (original, draft) in enumerate(pairs, 1)
-    )
-    context_chars = int(cfg.get("review_context_chars", 2600))
-    system = f"""你是多语言小说译文的资深校对编辑。目标语言是{cfg['target_language']}。
-请对照日文原文校订初译，而不是脱离原文重写。
-规则：
-1. 修正误译、漏译、代词指向、人物口吻、时态、语气和不自然的目标语言表达。
-2. 保持信息完整，不添加原文没有的解释，不删减敏感或困难内容。
-3. 固有名词严格遵守术语表，并与前文终稿一致。
-4. 保持段落数量和顺序不变。
-5. 只返回 JSON：{{"translations":["校对后的第一段", "第二段"]}}。
-
-固定译名表：
-{glossary_text(cfg)}"""
-    user = (
-        f"前文终稿（仅供一致性参考，不要重写）：\n{previous_final[-context_chars:]}"
-        f"\n\n本批原文与8B初译：\n{items}"
-    )
-    payload = {
-        "model": cfg["review_model"],
-        "format": "json",
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "options": {"temperature": max(0.5, float(cfg.get("temperature", 0.2))) if _repeat_retry else min(float(cfg.get("temperature", 0.2)), 0.15)},
-    }
-    try:
-        content = ollama_chat_content(payload, cfg)
-    except RuntimeError as exc:
-        if "token repeat limit reached" not in str(exc).lower():
-            raise
-        if len(pairs) > 1:
-            print(f"  校對模型遇到重複 token 限制，自動拆分 {len(pairs)} 段重試……", flush=True)
-            midpoint = len(pairs) // 2
-            first = review_chunk(pairs[:midpoint], cfg, previous_final)
-            continued_context = "\n".join(part for part in [previous_final, *first] if part)
-            return first + review_chunk(pairs[midpoint:], cfg, continued_context)
-        if _repeat_retry:
-            raise
-        print("  校對模型遇到重複 token 限制，單段改用較高溫度重試一次……", flush=True)
-        return review_chunk(pairs, cfg, "", _repeat_retry=True)
-    try:
-        translations = json.loads(content)["translations"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RuntimeError(f"校对模型没有返回有效 JSON：{content[:300]}") from exc
-    if not isinstance(translations, list) or len(translations) != len(pairs):
-        raise RuntimeError(
-            f"校对模型返回 {len(translations) if isinstance(translations, list) else 0} 段，"
-            f"但预期 {len(pairs)} 段。"
-        )
-    return [normalize_output(normalize_text(str(value)), cfg["target_language"]) for value in translations]
-
-
-def proofread_episode(
-    episode: Episode, drafts: list[str], cfg: dict[str, Any], work_dir: Path
-) -> list[str]:
-    cache_path = work_dir / "review-cache.json"
-    cache: dict[str, str] = load_json(cache_path, {})
-    final: list[str] = []
-    missing_pairs: list[tuple[str, str]] = []
-    missing_positions: list[int] = []
-    keys: list[str] = []
-    for index, (original, draft) in enumerate(zip(episode.paragraphs, drafts)):
-        source = json.dumps(
-            [cfg["review_model"], cfg["target_language"], cfg.get("glossary", {}), original, draft],
-            ensure_ascii=False, sort_keys=True,
-        )
-        key = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        keys.append(key)
-        if key in cache:
-            final.append(cache[key])
-        else:
-            final.append("")
-            missing_pairs.append((original, draft))
-            missing_positions.append(index)
-    if missing_pairs:
-        batches = make_review_batches(
-            [pair[0] for pair in missing_pairs],
-            [pair[1] for pair in missing_pairs],
-            int(cfg.get("review_chunk_chars", 1400)),
-        )
-        cursor = 0
-        print(f"14B 需要校对 {len(missing_pairs)} 段，共 {len(batches)} 批。")
-        for batch_no, batch in enumerate(batches, 1):
-            print(f"  校对第 {batch_no}/{len(batches)} 批……", flush=True)
-            position = missing_positions[cursor]
-            previous = "\n".join(value for value in final[:position] if value)
-            reviewed = run_translation_batch(
-                lambda: review_chunk(batch, cfg, previous), cfg, "校對"
-            )
-            for value in reviewed:
-                pos = missing_positions[cursor]
-                final[pos] = value
-                cache[keys[pos]] = value
-                cursor += 1
-            atomic_json(cache_path, cache)
-    else:
-        print("本章已命中14B校对缓存。")
-    if cfg.get("check_glossary", True):
-        final = report_and_check_compliance(episode, final, cfg, label="14B校對")
-    return [normalize_output(value, cfg["target_language"]) for value in final]
 
 
 def add_or_update_project(
@@ -721,7 +611,6 @@ def add_or_update_project(
     work_dir: Path,
     cfg: dict[str, Any],
     images: list[dict[str, str]],
-    drafts: list[str] | None = None,
     build_now: bool = True,
 ) -> Path | None:
     project_path = work_dir / "project.json"
@@ -744,13 +633,12 @@ def add_or_update_project(
         "url": episode.url,
         "title": episode.episode_title,
         "model": cfg["model"],
-        "profile": cfg.get("profile", "自定义"),
         "fingerprint": fingerprint,
         "japanese": episode.paragraphs,
-        "draft_translation": drafts or translations,
+        "draft_translation": translations,
         "translation": translations,
-        "review_status": "reviewed" if drafts is not None else "single-stage",
-        "review_model": cfg.get("review_model") if drafts is not None else None,
+        "review_status": "single-stage",
+        "review_model": None,
         "blocks": blocks,
         "images": images,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -874,7 +762,7 @@ def browser_mode(cfg: dict[str, Any], fixed_work_dir: Path | None = None) -> Non
             page.goto("https://kakuyomu.jp/")
         print("\n請在瀏覽器中登入並開啟 Kakuyomu 或 小說家になろう 的小說章節。")
         print("回到此視窗按 Enter 翻譯當前章；输入 m 切换模型；输入 q 结束。")
-        print(f"当前模型：{cfg.get('profile', '自定义')} / {cfg['model']}\n")
+        print(f"当前模型：{cfg['model']}\n")
         pending_epub_updates = 0
         active_work_dir = fixed_work_dir
 
@@ -922,17 +810,12 @@ def browser_mode(cfg: dict[str, Any], fixed_work_dir: Path | None = None) -> Non
                 chapter_cfg = dict(cfg)
                 chapter_cfg["target_language"] = project.get("language", cfg["target_language"])
                 drafts = translate_episode(episode, chapter_cfg, work_dir)
-                if chapter_cfg.get("dual_stage"):
-                    print(f"8B 初译完成，开始由 {chapter_cfg['review_model']} 校对。")
-                    translations = proofread_episode(episode, drafts, chapter_cfg, work_dir)
-                else:
-                    translations = drafts
+                translations = drafts
                 images = download_episode_images(context, episode, work_dir)
                 next_pending = pending_epub_updates + 1
                 build_now = next_pending >= 10
                 epub_path = add_or_update_project(
                     episode, translations, work_dir, chapter_cfg, images,
-                    drafts=drafts if chapter_cfg.get("dual_stage") else None,
                     build_now=build_now,
                 )
                 pending_epub_updates = 0 if build_now else next_pending
@@ -969,6 +852,9 @@ def _launch_context(playwright: Any, cfg: dict[str, Any]) -> BrowserContext:
         if not executable or not Path(executable).is_file():
             raise ValueError("自訂瀏覽器執行檔不存在，請重新選擇瀏覽器。")
         options["executable_path"] = executable
+    elif browser == "chromium" and not Path(playwright.chromium.executable_path).is_file():
+        print("首次使用 Playwright Chromium，正在安装浏览器……", flush=True)
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     try:
         context = playwright.chromium.launch_persistent_context(str(profile), **options)
     except Exception as exc:
@@ -1126,16 +1012,29 @@ def _translated_chapter(chapter: SourceChapter, translations: list[str]) -> Sour
 class TranslationBook:
     """Persist completed chapters and build small EPUBs before merging the full book."""
 
-    def __init__(self, source: Path, work_dir: Path, metadata: dict[str, Any], language: str):
+    def __init__(self, source: Path, work_dir: Path, metadata: dict[str, Any], language: str,
+                 source_chapters: list[SourceChapter] | None = None):
         self.work_dir = work_dir
         self.language = language
         self.path = work_dir / "translation-project.json"
         source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
-        saved = load_json(self.path, {})
-        if saved and (saved.get("source_hash"), language_code(saved.get("language", ""))) != (source_hash, language_code(language)):
-            raise ValueError("翻譯專案的原文或目標語言已變更，請使用另一個輸出資料夾。")
+        saved = load_translation_state(self.path)
+        if saved and language_code(saved.get("language", "")) != language_code(language):
+            raise ValueError("翻譯專案的目標語言已變更，請使用另一個輸出資料夾。")
+        if saved and saved.get("source_hash") != source_hash:
+            records = saved["chapters"]
+            if source_chapters is None or len(source_chapters) < len(records) or any(
+                record["url"] != source_chapters[i].url or
+                record["source_hash"] != compute_content_hash(source_chapters[i].paragraphs)
+                for i, record in enumerate(records)
+            ):
+                raise ValueError("原文已變更或章節順序不符，請先核對變更，再使用另一個輸出資料夾。")
+            saved["source_hash"] = source_hash
+            saved["epub_dirty"] = True
+            save_translation_state(self.path, saved)
         self.state = saved or {"source_hash": source_hash, "language": language,
                                "metadata": metadata, "chapters": []}
+        self.state["source_path"] = str(source.resolve())
         self.metadata = self.state["metadata"]
         for key in ("title", "description"):
             if self.metadata.get(key):
@@ -1150,6 +1049,9 @@ class TranslationBook:
             records[index - 1]["source_hash"] != compute_content_hash(chapter.paragraphs)
         ):
             raise ValueError("原文章節已變更，請使用另一個輸出資料夾以免覆蓋已譯內容。")
+        if "source_paragraphs" not in records[index - 1]:
+            records[index - 1]["source_paragraphs"] = chapter.paragraphs
+            save_translation_state(self.path, self.state, [index - 1])
         return True
 
     def save(self, index: int, original: SourceChapter, translated: SourceChapter) -> None:
@@ -1157,12 +1059,13 @@ class TranslationBook:
             raise ValueError("章節必須依原書順序接續寫入。")
         self.state["chapters"].append({
             "url": original.url, "source_hash": compute_content_hash(original.paragraphs),
+            "source_paragraphs": original.paragraphs,
             "title": translated.title, "paragraphs": translated.paragraphs,
             "blocks": translated.blocks,
             "images": [{k: str(v) if isinstance(v, Path) else v for k, v in image.items()
                         if k != "data"} for image in translated.images],
         })
-        atomic_json(self.path, self.state)
+        save_translation_state(self.path, self.state, [index - 1])
 
     def _chapters(self, start: int, end: int) -> list[SourceChapter]:
         return [SourceChapter(url=record["url"], title=record["title"],
@@ -1181,14 +1084,14 @@ class TranslationBook:
         if index % 10 == 0 or index == total:
             start = ((index - 1) // 10) * 10 + 1
             part = self.work_dir / f"{self.output.stem}_{start:04d}-{index:04d}.epub"
-            if not part.exists():
+            if not part.exists() or self.state.get("epub_dirty"):
                 outputs.append(self._build(start, index, part))
         if index % 100 == 0 and (
             self.state.get("merged_up_to", 0) < index or not self.output.exists()
         ):
             outputs.append(self._build(1, index, self.output))
             self.state["merged_up_to"] = index
-            atomic_json(self.path, self.state)
+            save_translation_state(self.path, self.state)
         return outputs
 
     def finish(self, total: int) -> Path:
@@ -1196,8 +1099,154 @@ class TranslationBook:
             raise ValueError("尚有章節未完成，不能合併全書。")
         output = self._build(1, total, self.output)
         self.state["merged_up_to"] = total
-        atomic_json(self.path, self.state)
+        self.state["epub_dirty"] = False
+        save_translation_state(self.path, self.state)
         return output
+
+
+class MissingProjectSource(ValueError):
+    """An older translation project needs its original EPUB once."""
+
+
+def project_exists(work_dir: Path) -> bool:
+    return any((work_dir / name).exists() for name in ("translation-project.json", "project.json"))
+
+
+def load_review_project(work_dir: Path, source: Path | None = None) -> dict:
+    path = work_dir / "translation-project.json"
+    if not path.exists():
+        project = load_json(work_dir / "project.json", {})
+        if not project:
+            raise ValueError("找不到有效项目。")
+        return project
+    state = load_translation_state(path)
+    missing = [i for i, ch in enumerate(state["chapters"]) if "source_paragraphs" not in ch]
+    if missing:
+        source = source or (Path(state["source_path"]) if state.get("source_path") else None)
+        if source is None or not source.is_file():
+            raise MissingProjectSource("旧翻译项目尚未保存原文，请选择创建项目时的原始 EPUB。")
+        if hashlib.sha256(source.read_bytes()).hexdigest() != state["source_hash"]:
+            raise ValueError("所选 EPUB 与项目原文不匹配。")
+        _, originals = extract_epub_chapters(source, work_dir / "assets")
+        for index in missing:
+            record = state["chapters"][index]
+            if index >= len(originals) or record["url"] != originals[index].url or record["source_hash"] != compute_content_hash(originals[index].paragraphs):
+                raise ValueError("原文章节与旧项目不匹配，无法恢复对应关系。")
+            record["source_paragraphs"] = originals[index].paragraphs
+        state["source_path"] = str(source.resolve())
+        save_translation_state(path, state, missing)
+    return state
+
+
+def project_glossary(cfg: dict, work_dir: Path, project: dict) -> list:
+    local = dict(cfg)
+    local["glossary"] = output_glossary(cfg, project.get("language", cfg.get("target_language", "繁體中文")))
+    return get_effective_glossary(local, work_dir)
+
+
+def audit_project(project: dict, entries: list) -> list:
+    results = []
+    for chapter in project.get("chapters", []):
+        source = chapter.get("source_paragraphs") or chapter.get("japanese", [])
+        target = chapter.get("translation") or chapter.get("paragraphs", [])
+        if not source and not target and any(block.get("type") == "image" for block in chapter.get("blocks", [])):
+            continue
+        if not source or len(source) != len(target):
+            raise ValueError(f"章节《{chapter.get('title', '')}》缺少完整的原文/译文对应关系，不能判定稽核通过。")
+        violations, _ = check_glossary_compliance(source, target, entries)
+        results.extend((chapter.get("title", ""), violation) for violation in violations)
+        if language_code(project.get("language", "")) != "ja":
+            results.extend((chapter.get("title", ""), warning)
+                           for warning in check_translation_quality(source, target))
+    return results
+
+
+def rebuild_project(work_dir: Path, project: dict) -> Path:
+    if project.get("base_epub"):
+        return build_extended_epub(project, work_dir)
+    metadata = project.get("metadata") or {"title": project.get("work_title", work_dir.name),
+                                           "author": project.get("author", ""),
+                                           "description": project.get("description", "")}
+    language = project.get("language", "繁體中文")
+    chapters = [SourceChapter(url=ch.get("url", ""), title=ch["title"],
+                              paragraphs=ch.get("translation") or ch.get("paragraphs", []),
+                              blocks=ch.get("blocks", []), images=ch.get("images", []))
+                for ch in project["chapters"]]
+    # Imported text projects can contain paths relative to their project folder.
+    for chapter in chapters:
+        chapter.images = [dict(image) for image in chapter.images]
+        for image in chapter.images:
+            if image.get("local_path") and not Path(image["local_path"]).is_absolute():
+                image["local_path"] = str(work_dir / image["local_path"])
+    output = work_dir / f"{safe_name(metadata['title'])}_{language_suffix(language)}.epub"
+
+    def build(items, destination):
+        temporary = destination.with_suffix(".tmp.epub")
+        translated_source_epub(metadata, items, temporary, language)
+        temporary.replace(destination)
+
+    build(chapters, output)
+    if (work_dir / "translation-project.json").exists():
+        for start in range(0, len(chapters), 10):
+            end = min(start + 10, len(chapters))
+            part = work_dir / f"{output.stem}_{start + 1:04d}-{end:04d}.epub"
+            build(chapters[start:end], part)
+    return output
+
+
+def retranslate_project(work_dir: Path, cfg: dict, terms: list[str], progress=None) -> Path:
+    project = load_review_project(work_dir)
+    local = dict(cfg)
+    local["target_language"] = project.get("language", cfg.get("target_language", "繁體中文"))
+    local["glossary"] = entries_to_dict(project_glossary(cfg, work_dir, project))
+    affected = find_affected_chapters(project["chapters"], terms)
+    for number, item in enumerate(affected, 1):
+        check_translation_cancelled(local)
+        index = item["index"] - 1
+        record = project["chapters"][index]
+        original = record.get("source_paragraphs") or record.get("japanese", [])
+        translations = list(record.get("translation") or record.get("paragraphs", []))
+        if not original or len(original) != len(translations):
+            raise ValueError(f"章节《{record['title']}》缺少完整的原文/译文对应关系。")
+        # Translate only affected paragraphs, retaining adjacent translated context.
+        for pos in item["affected_paragraphs"]:
+            context = "\n".join(translations[:pos])
+            result = run_translation_batch(
+                lambda: translate_chunk([original[pos]], local, context), local, "局部重译")
+            check_translation_cancelled(local)
+            translations[pos] = result[0]
+        blocks = []
+        iterator = iter(translations)
+        source_blocks = record.get("blocks") or [{"type": "text"} for _ in translations]
+        if sum(block.get("type") == "text" for block in source_blocks) != len(translations):
+            raise ValueError(f"章节《{record['title']}》的排版段落与译文不一致。")
+        for block in source_blocks:
+            block = dict(block)
+            if block.get("type") == "text":
+                value = next(iterator)
+                block["text"] = value
+                if project.get("base_epub"):
+                    block["translation"] = value
+            blocks.append(block)
+        record.update(blocks=blocks, paragraphs=translations)
+        if "translation" in record or project.get("base_epub"):
+            record["translation"] = translations
+            record["draft_translation"] = translations
+        project["epub_dirty"] = True
+        if (work_dir / "translation-project.json").exists():
+            save_translation_state(work_dir / "translation-project.json", project, [index])
+        else:
+            atomic_json(work_dir / "project.json", project)
+        if progress:
+            progress(number / len(affected) * 100, record["title"])
+    check_translation_cancelled(local)
+    output = rebuild_project(work_dir, project)
+    project["epub_dirty"] = False
+    if (work_dir / "translation-project.json").exists():
+        save_translation_state(work_dir / "translation-project.json", project)
+    else:
+        atomic_json(work_dir / "project.json", project)
+    return output
 
 
 def translation_work_dir(source: Path, cfg: dict[str, Any], language: str) -> Path:
@@ -1241,7 +1290,7 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     def translate(ep):
         check_cancelled()
         drafts = translate_episode(ep, chapter_cfg, work_dir)
-        return proofread_episode(ep, drafts, chapter_cfg, work_dir) if cfg.get("dual_stage") else drafts
+        return drafts
 
     values = [metadata.get("title", source.stem)]
     if metadata.get("description"):
@@ -1251,7 +1300,7 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     metadata["title"] = final[0]
     if len(final) > 1:
         metadata["description"] = final[1]
-    book = TranslationBook(source, work_dir, metadata, language)
+    book = TranslationBook(source, work_dir, metadata, language, chapters)
     for index, chapter in enumerate(chapters, 1):
         check_cancelled()
         if progress:
@@ -1321,8 +1370,7 @@ def translate_source_epub(
                                blocks=[{"type": "text", "text": value} for value in meta_values])
         meta_draft = translate_episode(meta_episode, chapter_cfg, work_dir)
         meta_final = (
-            proofread_episode(meta_episode, meta_draft, chapter_cfg, work_dir)
-            if chapter_cfg.get("dual_stage") else meta_draft
+            meta_draft
         )
         metadata["title"] = meta_final[0]
         if len(meta_final) > 1:
@@ -1342,12 +1390,11 @@ def translate_source_epub(
                                 blocks=[{"type": "text", "text": chapter.title}])
         title_draft = translate_episode(title_episode, chapter_cfg, work_dir)
         translated_title = (
-            proofread_episode(title_episode, title_draft, chapter_cfg, work_dir)[0]
-            if chapter_cfg.get("dual_stage") else title_draft[0]
+            title_draft[0]
         )
         episode.episode_title = translated_title
         drafts = translate_episode(episode, chapter_cfg, work_dir)
-        translations = proofread_episode(episode, drafts, chapter_cfg, work_dir) if chapter_cfg.get("dual_stage") else drafts
+        translations = drafts
         if append_to_existing:
             images = []
             for image in chapter.images:
@@ -1355,8 +1402,7 @@ def translate_source_epub(
                 images.append({"key": image["key"], "local_path": str(local.relative_to(work_dir)),
                                "media_type": image["media_type"], "alt": image.get("alt", "")})
             add_or_update_project(episode, translations, work_dir, chapter_cfg, images,
-                                  drafts=drafts if chapter_cfg.get("dual_stage") else None,
-                                  build_now=False)
+                                                build_now=False)
             if index % 10 == 0 or index == len(chapters):
                 current = load_json(work_dir / "project.json", {})
                 count = 10 if index % 10 == 0 else index % 10
@@ -1575,168 +1621,51 @@ def add_edit_glossary_flow(cfg: dict[str, Any]) -> None:
     print(f"已儲存術語：「{src}」 => 「{tgt}」【{cat}】")
 
 
-def audit_glossary_compliance_flow(cfg: dict[str, Any]) -> None:
-    print("\n選擇要審查合規性的對象：")
-    print("  1. 審查已建立的專案 (project.json)")
-    print("  2. 手動輸入日文/中文段落測試")
-    opt = input("請輸入 1-2 [1]：").strip()
-    glossary = cfg.get("glossary", {})
-    if not glossary:
-        print("目前尚未設定術語表，請先建立或匯入術語表。")
-        return
+def _select_review_project() -> tuple[Path, dict]:
+    try:
+        work_dir = load_last_project()
+    except (ValueError, FileNotFoundError):
+        work_dir = None
+    if not work_dir or not project_exists(work_dir):
+        work_dir = Path(input("请输入项目文件夹路径：").strip().strip('"'))
+    try:
+        return work_dir, load_review_project(work_dir)
+    except MissingProjectSource:
+        source = select_epub_file("选择创建旧项目时的原始 EPUB")
+        return work_dir, load_review_project(work_dir, source)
 
-    if opt in {"", "1"}:
-        try:
-            work_dir = load_last_project()
-        except Exception:
-            work_dir = None
-        if not work_dir or not (work_dir / "project.json").exists():
-            path_str = input("請輸入專案資料夾路徑：").strip().strip('"')
-            work_dir = Path(path_str) if path_str else None
-        if not work_dir or not (work_dir / "project.json").exists():
-            print("找不到有效專案。")
-            return
-        project = load_json(work_dir / "project.json", {})
-        total_violations = 0
-        for ch in project.get("chapters", []):
-            ch_title = ch.get("title", "")
-            ja_paras = ch.get("japanese", []) or ch.get("source_paragraphs", [])
-            zh_paras = ch.get("translation", []) or ch.get("paragraphs", [])
-            if ja_paras and zh_paras:
-                violations, _ = check_glossary_compliance(ja_paras, zh_paras, glossary)
-                if violations:
-                    print(f"\n【章節：{ch_title}】發現 {len(violations)} 處未符合術語表：")
-                    for v in violations:
-                        print(f"  - 第 {v.paragraph_index} 段【{v.category}】：原文「{v.source}」-> 應譯為「{v.expected_target}」")
-                        print(f"    原文：{v.original_text[:60]}")
-                        print(f"    譯文：{v.translated_text[:60]}")
-                    total_violations += len(violations)
-        if total_violations == 0:
-            print("\n審查完成！專案中所有章節皆符合術語表規範。")
-        else:
-            print(f"\n審查完成，共發現 {total_violations} 處術語合規警示。")
-    elif opt == "2":
-        ja = input("請輸入日文段落：").strip()
-        zh = input("請輸入中文譯文：").strip()
-        violations, _ = check_glossary_compliance([ja], [zh], glossary)
-        if violations:
-            print(f"\n發現 {len(violations)} 處未符合術語表：")
-            for v in violations:
-                print(f"  - 原文「{v.source}」【{v.category}】未正確譯為「{v.expected_target}」")
-        else:
-            print("\n審查通過，未發現術語違規！")
+
+def audit_glossary_compliance_flow(cfg: dict[str, Any]) -> None:
+    print("\n1. 稽核项目（支持新旧项目）\n2. 手动输入原文/译文测试")
+    if input("请选择 [1]：").strip() == "2":
+        source = input("原文：").strip()
+        target = input("译文：").strip()
+        violations, _ = check_glossary_compliance([source], [target], cfg.get("glossary", {}))
+        results = [("手动测试", violation) for violation in violations]
+    else:
+        work_dir, project = _select_review_project()
+        results = audit_project(project, project_glossary(cfg, work_dir, project))
+    for title, violation in results:
+        print(f"《{title}》第 {violation.paragraph_index} 段：{violation.source} → {violation.expected_target}")
+    print(f"稽核完成，共 {len(results)} 处术语警示。")
 
 
 def retranslate_by_term_scope_flow(cfg: dict[str, Any]) -> None:
-    print("\n================ 按術語影響範圍局部重譯 ================")
-    try:
-        work_dir = load_last_project()
-    except Exception:
-        work_dir = None
-    if not work_dir or not (work_dir / "project.json").exists():
-        path_str = input("請輸入專案資料夾路徑（包含 project.json）：").strip().strip('"')
-        work_dir = Path(path_str) if path_str else None
-    if not work_dir or not (work_dir / "project.json").exists():
-        print("找不到有效專案資料夾。")
-        return
-
-    project = load_json(work_dir / "project.json", {})
-    chapters = project.get("chapters", [])
-    if not chapters:
-        print("專案中沒有任何章節記錄。")
-        return
-
-    effective_entries = get_effective_glossary(cfg, work_dir)
-    effective_dict = entries_to_dict(effective_entries)
-    print(f"\n專案：{work_dir.name}（共 {len(chapters)} 章）")
-    print(f"目前生效術語表共 {len(effective_dict)} 條。")
-
-    terms_input = input("\n請輸入需要重譯影響範圍的日文術語（多個術語請用逗號分隔，輸入 'all' 檢查所有術語）：").strip()
-    if not terms_input:
-        print("已取消。")
-        return
-
-    if terms_input.lower() == "all":
-        query_terms = list(effective_dict.keys())
-    else:
-        query_terms = [t.strip() for t in re.split(r"[,，、\s]+", terms_input) if t.strip()]
-
-    affected = find_affected_chapters(chapters, query_terms)
+    work_dir, project = _select_review_project()
+    entries = project_glossary(cfg, work_dir, project)
+    value = input("请输入要重译的原文术语（逗号分隔，all 表示全部术语）：").strip()
+    terms = list(entries_to_dict(entries)) if value.lower() == "all" else [t for t in re.split(r"[,，、\s]+", value) if t]
+    affected = find_affected_chapters(project.get("chapters", []), terms)
     if not affected:
-        print("\n未在專案中找到包含指定術語的章節段落，無須重譯。")
+        print("没有受影响的段落。")
         return
-
-    total_paras = sum(len(a["affected_paragraphs"]) for a in affected)
-    print(f"\n【受影響範圍分析】")
-    print(f"  - 涉及章節：{len(affected)} / {len(chapters)} 章")
-    print(f"  - 涉及段落：{total_paras} 段")
-    for a in affected[:10]:
-        print(f"    * 第 {a['index']} 章《{a['title']}》：{len(a['affected_paragraphs'])} 段命中 [{', '.join(a['matched_terms'])}]")
-    if len(affected) > 10:
-        print(f"    ... 以及其他 {len(affected) - 10} 個章節。")
-
-    ans = input("\n是否確認僅對以上受影響章節進行局部重譯？[Y/n] ").strip().lower()
-    if ans == "n":
-        print("已取消重譯。")
+    count = sum(len(item["affected_paragraphs"]) for item in affected)
+    if input(f"将重译 {len(affected)} 章中的 {count} 个段落，继续？[Y/n] ").strip().lower() == "n":
         return
-
     ensure_model(cfg)
-    if cfg.get("dual_stage"):
-        ensure_model(cfg, cfg["review_model"])
-
-    chapter_cfg = dict(cfg)
-    chapter_cfg["target_language"] = project.get("language", cfg.get("target_language", "繁體中文"))
-    chapter_cfg["glossary"] = effective_dict
-
-    print("\n開始執行局部重譯……")
-    for item in affected:
-        ch_idx = item["index"] - 1
-        ch_record = chapters[ch_idx]
-        title = ch_record.get("title", f"第 {item['index']} 章")
-        print(f"\n[重譯章節 {item['index']}/{len(chapters)}] {title}")
-
-        ja_paras = ch_record.get("japanese", []) or ch_record.get("source_paragraphs", [])
-        if not ja_paras:
-            continue
-
-        blocks = ch_record.get("blocks", [])
-        ep_blocks = []
-        for b in blocks:
-            if b.get("type") == "image":
-                ep_blocks.append({"type": "image", "url": b.get("key", ""), "alt": b.get("alt", "")})
-            else:
-                ep_blocks.append({"type": "text", "text": ""})
-
-        episode = Episode(
-            url=ch_record.get("url", f"chapter_{item['index']}"),
-            work_title="",
-            episode_title=title,
-            paragraphs=ja_paras,
-            blocks=ep_blocks,
-        )
-
-        drafts = translate_episode(episode, chapter_cfg, work_dir)
-        translations = (
-            proofread_episode(episode, drafts, chapter_cfg, work_dir)
-            if chapter_cfg.get("dual_stage")
-            else drafts
-        )
-
-        images = ch_record.get("images", [])
-        add_or_update_project(
-            episode,
-            translations,
-            work_dir,
-            chapter_cfg,
-            images,
-            drafts=drafts if chapter_cfg.get("dual_stage") else None,
-            build_now=False,
-        )
-
-    rebuilt_project = load_json(work_dir / "project.json", {})
-    output_epub = build_extended_epub(rebuilt_project, work_dir)
-    print(f"\n局部重譯已完成！EPUB 已同步更新：{output_epub}")
-
+    output = retranslate_project(work_dir, cfg, terms,
+                                 lambda percent, title: print(f"{percent:.0f}% {title}"))
+    print(f"局部重译完成：{output}")
 
 def heuristic_candidate_flow(cfg: dict[str, Any]) -> None:
     print("\n================ 快��提取候選術語（啟發式） ================")

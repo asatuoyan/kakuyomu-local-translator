@@ -1,7 +1,6 @@
 {
   "ollama_url": "http://127.0.0.1:11434",
-  "model": "aya-expanse-8b-GGUF:Q5_K_M",
-  "custom_model": "aya-expanse-8b-GGUF:Q5_K_M",
+  "model": "hf.co/tencent/Hy-MT2-7B-GGUF:Q4_K_M",
   "target_language": "繁體中文",
   "output_dir": "output",
   "browser_profile_dir": "browser-profile",
@@ -13,9 +12,6 @@
   "translation_max_retries": 5,
   "translation_retry_delay_seconds": 10,
   "context_chars": 1200,
-  "review_model": "qwen3:14b",
-  "review_chunk_chars": 1400,
-  "review_context_chars": 2600,
   "request_timeout_seconds": 600,
   "request_delay_seconds": 8.0,
   "temperature": 0.2,
