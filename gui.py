@@ -381,6 +381,7 @@ class TranslatorGUI(tk.Tk):
                                  activebackground=hover, activeforeground=p["text"], disabledforeground=p["disabled"])
             elif isinstance(widget, tk.Toplevel):
                 widget.configure(background=p["background"])
+                self._set_titlebar_theme(widget)
             elif isinstance(widget, ttk.Combobox):
                 # A previously opened dropdown keeps its own classic Tk colors.
                 popup_list = f"{widget}.popdown.f.l"
@@ -398,16 +399,14 @@ class TranslatorGUI(tk.Tk):
 
     def _init_ui(self):
         # Three main functions share a single menu in the top bar.
-        top = ttk.Frame(self, style="Shell.TFrame", padding=(18, 12, 18, 8))
+        top = ttk.Frame(self, style="Shell.TFrame", padding=(24, 18, 24, 12))
         top.pack(fill=tk.X)
         self.function_button = ttk.Button(top, text="获取小说 ▾", command=self._show_function_menu)
         self.function_button.pack(side=tk.LEFT)
-        self.search_button = ttk.Button(top, text="搜索功能…  Ctrl+K", command=self._open_command_palette)
-        self.search_button.pack(side=tk.LEFT, padx=(10, 0))
         self.current_work_var = tk.StringVar(value="")
         self.current_work_label = ttk.Label(top, textvariable=self.current_work_var,
                                              style="Status.TLabel", anchor=tk.CENTER)
-        self.current_work_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=16)
+        self.current_work_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=24)
         self.settings_button = ttk.Button(top, text="⚙ 设置", command=self._open_settings)
         self.settings_button.pack(side=tk.RIGHT)
         self.function_choice = tk.StringVar(value="获取小说")
@@ -416,20 +415,18 @@ class TranslatorGUI(tk.Tk):
             self.function_menu.add_radiobutton(label=label, value=label, variable=self.function_choice,
                                                 command=lambda page=key: self._select_page(page))
         self.bind("<Escape>", lambda _: self.function_menu.unpost())
-        self.bind_all("<Control-k>", self._open_command_palette)
-        self.bind_all("<Control-K>", self._open_command_palette)
 
         body = ttk.Frame(self, style="Shell.TFrame")
         body.pack(fill=tk.BOTH, expand=True)
         self.notebook = PageHost(body)
         self.notebook.configure(style="PageHost.TFrame")
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=18, pady=(4, 8))
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=24, pady=(4, 10))
 
-        self.tab_download = ttk.Frame(self.notebook, padding=14)
-        self.tab_import = ttk.Frame(self.notebook, padding=14)
-        self.tab_glossary = ttk.Frame(self.notebook, padding=14)
-        self.tab_translate = ttk.Frame(self.notebook, padding=14)
-        self.tab_audit = ttk.Frame(self.notebook, padding=14)
+        self.tab_download = ttk.Frame(self.notebook, padding=20)
+        self.tab_import = ttk.Frame(self.notebook, padding=20)
+        self.tab_glossary = ttk.Frame(self.notebook, padding=20)
+        self.tab_translate = ttk.Frame(self.notebook, padding=20)
+        self.tab_audit = ttk.Frame(self.notebook, padding=20)
 
         self.notebook.add(self.tab_download, text="下载")
         self.notebook.add(self.tab_import, text="导入")
@@ -453,7 +450,7 @@ class TranslatorGUI(tk.Tk):
             variable.trace_add("write", lambda *_: self._update_current_work())
 
         # Bottom Global Log / Status Bar
-        footer = ttk.Frame(self, style="Shell.TFrame", padding=(16, 6, 16, 10))
+        footer = ttk.Frame(self, style="Shell.TFrame", padding=(24, 6, 24, 14))
         footer.pack(side=tk.BOTTOM, fill=tk.X)
         status_row = ttk.Frame(footer, style="Shell.TFrame")
         status_row.pack(fill=tk.X)
@@ -484,59 +481,6 @@ class TranslatorGUI(tk.Tk):
     def _show_function_menu(self):
         self.function_menu.tk_popup(self.function_button.winfo_rootx(),
                                      self.function_button.winfo_rooty() + self.function_button.winfo_height())
-
-    def _open_command_palette(self, _event=None):
-        existing = getattr(self, "command_palette", None)
-        if existing and existing.winfo_exists():
-            existing.lift()
-            existing.focus_force()
-            return
-        window = tk.Toplevel(self)
-        self.command_palette = window
-        window.title("搜索功能")
-        window.geometry("430x310")
-        window.configure(background=self.palette["background"])
-        window.transient(self)
-        self._set_titlebar_theme(window)
-        frame = ttk.Frame(window, padding=16)
-        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        query = tk.StringVar()
-        entry = ttk.Entry(frame, textvariable=query)
-        entry.pack(fill=tk.X, pady=(0, 10))
-        choices = tk.Listbox(frame, activestyle="none", font=("Microsoft YaHei UI", 13),
-                              relief=tk.FLAT, highlightthickness=1)
-        choices.pack(fill=tk.BOTH, expand=True)
-        commands = (("获取小说 · 网络下载", lambda: self._select_page("download")),
-                    ("获取小说 · 本地导入", lambda: self._select_page("import")),
-                    ("翻译小说", lambda: self._select_page("translate")),
-                    ("术语管理", lambda: self._select_page("glossary")),
-                    ("检查译文", lambda: self._select_page("audit")),
-                    ("设置", self._open_settings), ("运行日志", self._toggle_log))
-        visible = []
-        def refresh(*_):
-            visible.clear()
-            choices.delete(0, tk.END)
-            term = query.get().strip().lower()
-            for label, action in commands:
-                if not term or term in label.lower():
-                    visible.append(action)
-                    choices.insert(tk.END, label)
-            if visible:
-                choices.selection_set(0)
-        def choose(_event=None):
-            selection = choices.curselection()
-            if selection:
-                action = visible[selection[0]]
-                window.destroy()
-                action()
-        query.trace_add("write", refresh)
-        entry.bind("<Return>", choose)
-        entry.bind("<Down>", lambda _: (choices.focus_set(), choices.selection_set(0)))
-        choices.bind("<Return>", choose)
-        choices.bind("<Double-Button-1>", choose)
-        window.bind("<Escape>", lambda _: window.destroy())
-        refresh()
-        entry.focus_set()
 
     def _add_page_actions(self):
         self.navigation_buttons = []
@@ -1383,17 +1327,11 @@ class TranslatorGUI(tk.Tk):
         self.lbl_active_glossary_path = ttk.Label(top_bar, text="全域 config.json", style="Muted.TLabel")
         self.lbl_active_glossary_path.pack(side=tk.LEFT, padx=8)
 
-        # Search & Filter
+        # Category filter
         filter_bar = ttk.Frame(f)
-        filter_bar.pack(fill=tk.X, pady=(0, 6))
+        filter_bar.pack(fill=tk.X, pady=(8, 12))
 
-        ttk.Label(filter_bar, text="搜尋：").pack(side=tk.LEFT)
-        self.glossary_search_var = tk.StringVar()
-        self.glossary_search_var.trace_add("write", lambda *_: self._filter_glossary_view())
-        entry_search = ttk.Entry(filter_bar, textvariable=self.glossary_search_var, width=25)
-        entry_search.pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(filter_bar, text="類別篩選：").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(filter_bar, text="類別篩選：").pack(side=tk.LEFT)
         self.category_filter_var = tk.StringVar(value="全部")
         cb_cat = ttk.Combobox(filter_bar, textvariable=self.category_filter_var, values=["全部"] + list(VALID_CATEGORIES), state="readonly", width=12)
         cb_cat.pack(side=tk.LEFT, padx=4)
@@ -1401,7 +1339,7 @@ class TranslatorGUI(tk.Tk):
 
         # Action Buttons
         btn_box = ttk.Frame(f)
-        btn_box.pack(fill=tk.X, pady=(0, 6))
+        btn_box.pack(fill=tk.X, pady=(0, 14))
 
         # Term editing actions
         ttk.Button(btn_box, text="新增术语", command=self._action_add_term).pack(side=tk.LEFT, padx=3)
@@ -1490,13 +1428,10 @@ class TranslatorGUI(tk.Tk):
         for item in self.glossary_tree.get_children():
             self.glossary_tree.delete(item)
 
-        q = self.glossary_search_var.get().strip().lower()
         cat_filter = self.category_filter_var.get()
 
         for e in self.current_glossary_entries:
             if cat_filter != "全部" and e.category != cat_filter:
-                continue
-            if q and (q not in e.source.lower() and q not in e.target.lower() and q not in e.note.lower()):
                 continue
             self.glossary_tree.insert("", tk.END, values=(e.source, e.target, e.category, e.note))
 
@@ -2151,7 +2086,7 @@ class TranslatorGUI(tk.Tk):
                 for widget in parent.winfo_children():
                     if (isinstance(widget, (ttk.Button, tk.Button))
                             and widget not in (self.log_toggle, self.function_button,
-                                               self.search_button, self.settings_button)
+                                               self.settings_button)
                             and widget not in self.navigation_buttons):
                         self._busy_button_states.append((widget, str(widget.cget("state"))))
                         widget.configure(state=tk.DISABLED)
