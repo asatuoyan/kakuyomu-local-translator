@@ -5,9 +5,9 @@ Simple, intuitive, and modern Tkinter interface.
 from __future__ import annotations
 
 import csv
+import ctypes
 import hashlib
 import json
-import os
 import queue
 import random
 import re
@@ -17,7 +17,8 @@ import time
 from pathlib import Path
 from typing import Any
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox as tk_messagebox, filedialog as tk_filedialog
+from opencc import OpenCC
 
 from glossary_manager import (
     VALID_CATEGORIES,
@@ -64,7 +65,6 @@ from text_importer import (
 )
 from main import (
     CONFIG_PATH,
-    APP_DIR,
     Episode,
     TranslationBook,
     TranslationCancelled,
@@ -90,21 +90,23 @@ from main import (translate_epub_language, load_review_project, MissingProjectSo
                   audit_project, project_glossary, retranslate_project)
 
 
-# Based on the supplied color guide, with a softer, higher-contrast light theme.
+# Restrained system palette with clear type hierarchy and one accent color.
 UI_PALETTES = {
     "light": {
-        "background": "#DDE3EB", "surface": "#EDF1F6", "container": "#CBD5E2",
-        "line": "#B6C1D0", "border": "#9CAABD", "text": "#151A29",
-        "secondary": "#253247", "muted": "#39485E", "subtle": "#526179",
-        "disabled": "#64748B", "accent": "#456AFF", "hover_source": "#1E253C",
-        "hover_alpha": 0.05,
+        "background": "#F5F5F7", "surface": "#FFFFFF", "container": "#E8E8ED",
+        "line": "#E5E5EA", "border": "#D2D2D7", "text": "#1D1D1F",
+        "secondary": "#3A3A3C", "muted": "#515154", "subtle": "#6E6E73",
+        "disabled": "#86868B", "accent": "#0071E3", "nav_selected": "#E8F2FF",
+        "nav_hover": "#ECECF0", "hover_source": "#1D1D1F",
+        "hover_alpha": 0.06,
     },
     "dark": {
-        "background": "#101010", "surface": "#1F2024", "container": "#2E2E31",
-        "line": "#3A3B40", "border": "#414248", "text": "#EDEFF2",
-        "secondary": "#D5D6DA", "muted": "#C8C8CC", "subtle": "#7D7E80",
-        "disabled": "#AAADB5", "accent": "#456AFF", "hover_source": "#FFFFFF",
-        "hover_alpha": 0.10,
+        "background": "#161617", "surface": "#242426", "container": "#363638",
+        "line": "#3A3A3C", "border": "#48484A", "text": "#F5F5F7",
+        "secondary": "#E5E5EA", "muted": "#C7C7CC", "subtle": "#A1A1A6",
+        "disabled": "#8E8E93", "accent": "#2997FF", "nav_selected": "#183550",
+        "nav_hover": "#303033", "hover_source": "#FFFFFF",
+        "hover_alpha": 0.08,
     },
 }
 
@@ -115,6 +117,40 @@ def blend_color(foreground: str, background: str, alpha: float) -> str:
         f"{round(int(foreground[i:i + 2], 16) * alpha + int(background[i:i + 2], 16) * (1 - alpha)):02X}"
         for i in (1, 3, 5)
     )
+
+
+_ui_converter = OpenCC("t2s")
+
+
+def ui_text(value: str) -> str:
+    """Convert interface copy without changing project or novel data."""
+    return _ui_converter.convert(value)
+
+
+class _LocalizedDialogs:
+    def __init__(self, provider):
+        self.provider = provider
+
+    def __getattr__(self, name):
+        method = getattr(self.provider, name)
+
+        def invoke(*args, **kwargs):
+            if self.provider is tk_messagebox:
+                args = tuple(ui_text(arg) if isinstance(arg, str) else arg for arg in args)
+                kwargs = {key: ui_text(value) if key in ("title", "message", "detail") and isinstance(value, str)
+                          else value for key, value in kwargs.items()}
+            elif isinstance(kwargs.get("title"), str):
+                kwargs["title"] = ui_text(kwargs["title"])
+                if "filetypes" in kwargs:
+                    kwargs["filetypes"] = [(ui_text(label), pattern)
+                                          for label, pattern in kwargs["filetypes"]]
+            return method(*args, **kwargs)
+
+        return invoke
+
+
+messagebox = _LocalizedDialogs(tk_messagebox)
+filedialog = _LocalizedDialogs(tk_filedialog)
 
 
 class TextRedirector:
@@ -131,18 +167,48 @@ class TextRedirector:
         pass
 
 
+class PageHost(ttk.Frame):
+    """Keep pages stacked without exposing a second navigation bar."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._pages = []
+        self._selected = None
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+    def add(self, page, *, text=""):
+        page.grid(row=0, column=0, sticky="nsew")
+        self._pages.append(page)
+        if self._selected is None:
+            self.select(page)
+
+    def select(self, page=None):
+        if page is None:
+            return str(self._selected) if self._selected is not None else ""
+        if isinstance(page, int):
+            page = self._pages[page]
+        if page not in self._pages:
+            raise ValueError("页面未添加到容器。")
+        page.tkraise()
+        self._selected = page
+        self.event_generate("<<NotebookTabChanged>>")
+
+
 class TranslatorGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("小說下載與本地 AI 翻譯器 (Kakuyomu / 小說家になろう)")
-        self.geometry("1020x760")
-        self.minsize(880, 640)
+        self.title(ui_text("小說下載與本地 AI 翻譯器 (Kakuyomu / 小說家になろう)"))
+        self.geometry("1120x760")
+        self.minsize(980, 680)
 
         self.cfg = load_config()
         self.log_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.active_thread: threading.Thread | None = None
         self.stop_requested = False
-        self.ui_theme = "light"
+        self.ui_theme = load_json(CONFIG_PATH, {}).get("ui_theme", "light")
+        if self.ui_theme not in UI_PALETTES:
+            self.ui_theme = "light"
 
         # Apply ttk style
         self.style = ttk.Style(self)
@@ -153,7 +219,67 @@ class TranslatorGUI(tk.Tk):
         self._configure_styles()
 
         self._init_ui()
+        self.after_idle(lambda: self._set_titlebar_theme(self))
+        self._localize_ui()
         self._poll_queue()
+
+    def _set_titlebar_theme(self, window):
+        """Match the Windows title bar to the selected light or dark palette."""
+        if sys.platform != "win32" or not window.winfo_exists():
+            return
+        dark = self.ui_theme == "dark"
+        if getattr(window, "_titlebar_dark", None) == dark:
+            return
+        try:
+            get_parent = ctypes.windll.user32.GetParent
+            get_parent.argtypes = [ctypes.c_void_p]
+            get_parent.restype = ctypes.c_void_p
+            client = window.winfo_id()
+            hwnd = get_parent(client) or client
+            value = ctypes.c_int(int(dark))
+            set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+            set_attribute.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                      ctypes.c_void_p, ctypes.c_ulong]
+            set_attribute.restype = ctypes.c_long
+            for attribute in (20, 19):
+                result = set_attribute(
+                    hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+                )
+                if result == 0:
+                    break
+            palette = UI_PALETTES[self.ui_theme]
+            for attribute, color in ((35, palette["background"]), (36, palette["text"])):
+                red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+                colorref = ctypes.c_uint(red | (green << 8) | (blue << 16))
+                set_attribute(hwnd, attribute, ctypes.byref(colorref), ctypes.sizeof(colorref))
+            window._titlebar_dark = dark
+        except (AttributeError, OSError):
+            pass
+
+    def _localize_ui(self):
+        """Convert labels created or updated by GUI callbacks."""
+        def visit(widget):
+            if isinstance(widget, (ttk.Label, ttk.Button, ttk.Checkbutton,
+                                   ttk.Radiobutton, ttk.LabelFrame, tk.Label, tk.Button)):
+                value = widget.cget("text")
+                if value:
+                    converted = ui_text(value)
+                    if converted != value:
+                        widget.configure(text=converted)
+            if isinstance(widget, ttk.Treeview):
+                for column in widget["columns"]:
+                    value = widget.heading(column, "text")
+                    converted = ui_text(value)
+                    if converted != value:
+                        widget.heading(column, text=converted)
+            if isinstance(widget, tk.Toplevel):
+                widget.title(ui_text(widget.title()))
+                self._set_titlebar_theme(widget)
+            for child in widget.winfo_children():
+                visit(child)
+
+        visit(self)
+        self.after(1000, self._localize_ui)
 
     def _configure_styles(self):
         p = UI_PALETTES[self.ui_theme]
@@ -161,7 +287,7 @@ class TranslatorGUI(tk.Tk):
         hover = blend_color(p["hover_source"], p["surface"], p["hover_alpha"])
         accent_hover = blend_color(p["hover_source"], p["accent"], p["hover_alpha"])
         self.configure(background=p["background"])
-        self.option_add("*Font", ("Microsoft JhengHei UI", 11))
+        self.option_add("*Font", ("Microsoft YaHei UI", 14))
         for widget in ("Listbox", "Text", "Menu"):
             self.option_add(f"*{widget}.background", p["surface"])
             self.option_add(f"*{widget}.foreground", p["text"])
@@ -176,45 +302,60 @@ class TranslatorGUI(tk.Tk):
         self.option_add("*Toplevel.background", p["background"])
         self.option_add("*TCombobox*Listbox.background", p["surface"])
         self.option_add("*TCombobox*Listbox.foreground", p["text"])
-        self.style.configure(".", font=("Microsoft JhengHei UI", 11),
-                             background=p["background"], foreground=p["text"],
+        self.style.configure(".", font=("Microsoft YaHei UI", 14),
+                             background=p["surface"], foreground=p["text"],
                              bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
                              troughcolor=p["surface"], focuscolor=p["accent"], selectbackground=p["accent"],
                              selectforeground="#FFFFFF")
         self.style.map(".", foreground=[("disabled", p["disabled"])])
+        self.style.configure("TFrame", background=p["surface"])
+        self.style.configure("Shell.TFrame", background=p["background"])
+        self.style.configure("TLabel", background=p["surface"], foreground=p["text"])
+        self.style.configure("Hero.TLabel", background=p["background"],
+                             foreground=p["text"], font=("Microsoft YaHei UI", 24, "bold"))
+        self.style.configure("Subtitle.TLabel", background=p["background"],
+                             foreground=p["muted"], font=("Microsoft YaHei UI", 13))
+        self.style.configure("Status.TLabel", background=p["background"],
+                             foreground=p["secondary"], font=("Microsoft YaHei UI", 13))
         for name in ("TButton", "TMenubutton"):
-            self.style.configure(name, padding=(10, 6), background=p["surface"])
-            self.style.map(name, background=[("disabled", p["surface"]), ("pressed", hover), ("active", hover)],
+            self.style.configure(name, padding=(12, 7), background=p["container"],
+                                 borderwidth=0, relief="flat", font=("Microsoft YaHei UI", 13, "bold"))
+            self.style.map(name, background=[("disabled", p["container"]), ("pressed", hover), ("active", hover)],
                            foreground=[("disabled", p["disabled"]), ("!disabled", p["text"])])
-        self.style.configure("TEntry", padding=5, fieldbackground=p["surface"], insertcolor=p["text"])
-        self.style.configure("TCombobox", padding=4, fieldbackground=p["surface"],
+        self.style.configure("TEntry", padding=6, fieldbackground=p["surface"], insertcolor=p["text"],
+                             bordercolor=p["border"], relief="flat")
+        self.style.map("TEntry", bordercolor=[("focus", p["accent"])])
+        self.style.configure("TCombobox", padding=6, fieldbackground=p["surface"],
                              background=p["surface"], arrowcolor=p["muted"])
         self.style.map("TCombobox", fieldbackground=[("readonly", p["surface"])],
                        foreground=[("disabled", p["disabled"]), ("readonly", p["text"])],
-                       background=[("active", hover)])
+                       background=[("active", hover)], bordercolor=[("focus", p["accent"])])
         for name in ("TRadiobutton", "TCheckbutton"):
             self.style.configure(name, indicatorbackground=p["surface"], indicatorforeground=p["text"])
             self.style.map(name, background=[("active", p["background"])],
                            indicatorbackground=[("disabled", p["surface"]), ("selected", p["accent"])],
                            indicatorforeground=[("selected", "#FFFFFF")])
-        self.style.configure("TLabelframe", bordercolor=p["border"], borderwidth=1, relief="solid")
-        self.style.configure("TLabelframe.Label", foreground=p["secondary"],
-                             font=("Microsoft JhengHei UI", 11, "bold"))
+        self.style.configure("TLabelframe", background=p["surface"], bordercolor=p["line"],
+                             borderwidth=1, relief="solid")
+        self.style.configure("TLabelframe.Label", background=p["surface"], foreground=p["text"],
+                             font=("Microsoft YaHei UI", 14, "bold"))
         self.style.configure("Muted.TLabel", foreground=p["muted"])
-        self.style.configure("Title.TLabel", font=("Microsoft JhengHei UI", 20, "bold"))
-        self.style.configure("Accent.TButton", background=p["accent"], foreground="#FFFFFF")
+        self.style.configure("Title.TLabel", background=p["background"],
+                             font=("Microsoft YaHei UI", 24, "bold"))
+        self.style.configure("Accent.TButton", background=p["accent"], foreground="#FFFFFF",
+                             padding=(16, 8), font=("Microsoft YaHei UI", 14, "bold"))
         self.style.map("Accent.TButton",
                        background=[("disabled", p["container"]), ("pressed", accent_hover), ("active", accent_hover)],
                        foreground=[("disabled", p["disabled"]), ("!disabled", "#FFFFFF")])
-        self.style.configure("TNotebook", borderwidth=0)
-        self.style.configure("TNotebook.Tab", padding=(16, 9), background=p["container"],
-                             foreground=p["secondary"], font=("Microsoft JhengHei UI", 11, "bold"))
-        self.style.map("TNotebook.Tab", background=[("selected", p["accent"]), ("active", hover)],
-                       foreground=[("selected", "#FFFFFF")])
-        self.style.configure("Treeview", rowheight=33, background=p["surface"], fieldbackground=p["surface"],
-                             foreground=p["text"])
-        self.style.configure("Treeview.Heading", padding=(6, 7), background=p["container"], foreground=p["secondary"],
-                             font=("Microsoft JhengHei UI", 11, "bold"))
+        self.style.configure("PageHost.TFrame", background=p["surface"])
+        self.style.configure("SourceSelected.TButton", background=p["nav_selected"],
+                             foreground=p["accent"], font=("Microsoft YaHei UI", 13, "bold"))
+        self.style.map("SourceSelected.TButton", background=[("active", p["nav_selected"])],
+                       foreground=[("active", p["accent"])])
+        self.style.configure("Treeview", rowheight=36, background=p["surface"], fieldbackground=p["surface"],
+                             foreground=p["text"], font=("Microsoft YaHei UI", 13), borderwidth=0)
+        self.style.configure("Treeview.Heading", padding=(8, 7), background=p["container"], foreground=p["secondary"],
+                             font=("Microsoft YaHei UI", 13, "bold"), relief="flat")
         self.style.map("Treeview.Heading", background=[("active", hover)])
         self.style.map("Treeview", background=[("selected", p["accent"])],
                        foreground=[("selected", "#FFFFFF")])
@@ -252,85 +393,272 @@ class TranslatorGUI(tk.Tk):
     def _toggle_theme(self):
         self.ui_theme = "dark" if self.ui_theme == "light" else "light"
         self._configure_styles()
-        self.theme_button.configure(text="淺色模式" if self.ui_theme == "dark" else "深色模式")
+        self._set_titlebar_theme(self)
+        self._save_preferences()
 
     def _init_ui(self):
-        # Top banner
-        top_frame = ttk.Frame(self, padding=(20, 14))
-        top_frame.pack(side=tk.TOP, fill=tk.X)
-        self.theme_button = ttk.Button(top_frame, text="深色模式", command=self._toggle_theme)
-        self.theme_button.pack(side=tk.RIGHT)
+        # Three main functions share a single menu in the top bar.
+        top = ttk.Frame(self, style="Shell.TFrame", padding=(18, 12, 18, 8))
+        top.pack(fill=tk.X)
+        self.function_button = ttk.Button(top, text="获取小说 ▾", command=self._show_function_menu)
+        self.function_button.pack(side=tk.LEFT)
+        self.search_button = ttk.Button(top, text="搜索功能…  Ctrl+K", command=self._open_command_palette)
+        self.search_button.pack(side=tk.LEFT, padx=(10, 0))
+        self.current_work_var = tk.StringVar(value="")
+        self.current_work_label = ttk.Label(top, textvariable=self.current_work_var,
+                                             style="Status.TLabel", anchor=tk.CENTER)
+        self.current_work_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=16)
+        self.settings_button = ttk.Button(top, text="⚙ 设置", command=self._open_settings)
+        self.settings_button.pack(side=tk.RIGHT)
+        self.function_choice = tk.StringVar(value="获取小说")
+        self.function_menu = tk.Menu(self, tearoff=0)
+        for label, key in (("获取小说", "download"), ("翻译小说", "translate"), ("检查译文", "audit")):
+            self.function_menu.add_radiobutton(label=label, value=label, variable=self.function_choice,
+                                                command=lambda page=key: self._select_page(page))
+        self.bind("<Escape>", lambda _: self.function_menu.unpost())
+        self.bind_all("<Control-k>", self._open_command_palette)
+        self.bind_all("<Control-K>", self._open_command_palette)
 
-        title_lbl = ttk.Label(
-            top_frame,
-            text="小說翻譯工作室",
-            style="Title.TLabel",
-        )
-        title_lbl.pack(anchor=tk.W)
+        body = ttk.Frame(self, style="Shell.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        self.notebook = PageHost(body)
+        self.notebook.configure(style="PageHost.TFrame")
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=18, pady=(4, 8))
 
-        author_lbl = ttk.Label(
-            top_frame,
-            text="下載或匯入原文，再用本機 AI 製作多語言 EPUB。",
-            style="Muted.TLabel",
-        )
-        author_lbl.pack(anchor=tk.W, pady=(3, 0))
+        self.tab_download = ttk.Frame(self.notebook, padding=14)
+        self.tab_import = ttk.Frame(self.notebook, padding=14)
+        self.tab_glossary = ttk.Frame(self.notebook, padding=14)
+        self.tab_translate = ttk.Frame(self.notebook, padding=14)
+        self.tab_audit = ttk.Frame(self.notebook, padding=14)
 
-        # Main Notebook Tabs
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=(4, 12))
-
-        self.tab_download = ttk.Frame(self.notebook, padding=10)
-        self.tab_import = ttk.Frame(self.notebook, padding=10)
-        self.tab_glossary = ttk.Frame(self.notebook, padding=10)
-        self.tab_translate = ttk.Frame(self.notebook, padding=10)
-        self.tab_audit = ttk.Frame(self.notebook, padding=10)
-
-        self.notebook.add(self.tab_download, text="下載小說")
-        self.notebook.add(self.tab_import, text="匯入檔案")
-        self.notebook.add(self.tab_translate, text="翻譯 EPUB")
-        self.notebook.add(self.tab_glossary, text="術語表")
-        self.notebook.add(self.tab_audit, text="檢查與重譯")
+        self.notebook.add(self.tab_download, text="下载")
+        self.notebook.add(self.tab_import, text="导入")
+        self.notebook.add(self.tab_translate, text="翻译")
+        self.notebook.add(self.tab_glossary, text="术语")
+        self.notebook.add(self.tab_audit, text="检查")
+        self.page_tabs = {
+            "download": self.tab_download, "import": self.tab_import,
+            "translate": self.tab_translate, "glossary": self.tab_glossary,
+            "audit": self.tab_audit,
+        }
+        self.notebook.bind("<<NotebookTabChanged>>", self._sync_navigation)
 
         self._setup_tab_download()
         self._setup_tab_import()
         self._setup_tab_glossary()
         self._setup_tab_translate()
         self._setup_tab_audit()
+        self._add_page_actions()
+        for variable in (self.tr_epub_var, self.proj_dir_var, self.audit_proj_var, self.import_title_var):
+            variable.trace_add("write", lambda *_: self._update_current_work())
 
         # Bottom Global Log / Status Bar
-        footer = ttk.Frame(self, padding=(20, 0, 20, 12))
-        footer.pack(side=tk.BOTTOM, fill=tk.X, before=self.notebook)
-        status_row = ttk.Frame(footer)
+        footer = ttk.Frame(self, style="Shell.TFrame", padding=(16, 6, 16, 10))
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        status_row = ttk.Frame(footer, style="Shell.TFrame")
         status_row.pack(fill=tk.X)
         self.status_var = tk.StringVar(value="就緒")
-        self.status_bar = ttk.Label(status_row, textvariable=self.status_var, anchor=tk.W)
+        self.status_var.trace_add("write", lambda *_: self._localize_status())
+        self.status_bar = ttk.Label(status_row, textvariable=self.status_var,
+                                    anchor=tk.W, style="Status.TLabel")
         self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.log_toggle = ttk.Button(status_row, text="顯示日誌", command=self._toggle_log)
-        self.log_toggle.pack(side=tk.RIGHT)
-        self.btn_stop = ttk.Button(status_row, text="中止翻译", command=self._action_stop, state=tk.DISABLED)
+        self.log_toggle = ttk.Button(status_row, text="运行日志", command=self._toggle_log)
+        self.log_toggle.pack(side=tk.RIGHT, padx=(8, 0))
+        self.btn_stop = ttk.Button(status_row, text="停止", command=self._action_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.RIGHT, padx=6)
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_bar = ttk.Progressbar(footer, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill=tk.X, pady=(8, 0))
-        self.log_panel = ttk.Frame(footer, padding=(0, 8, 0, 0))
+        self.progress_bar.pack(fill=tk.X, pady=(6, 0))
+        self.log_panel = ttk.Frame(footer, style="Shell.TFrame", padding=(0, 8, 0, 0))
         bot_frame = self.log_panel
 
-        self.log_text = tk.Text(bot_frame, height=5, wrap=tk.WORD, font=("Microsoft JhengHei UI", 11),
+        self.log_text = tk.Text(bot_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei UI", 13),
                                 bg=self.palette["surface"], fg=self.palette["secondary"],
                                 relief=tk.FLAT, padx=10, pady=8)
         log_scroll = ttk.Scrollbar(bot_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._sync_navigation()
+
+    def _show_function_menu(self):
+        self.function_menu.tk_popup(self.function_button.winfo_rootx(),
+                                     self.function_button.winfo_rooty() + self.function_button.winfo_height())
+
+    def _open_command_palette(self, _event=None):
+        existing = getattr(self, "command_palette", None)
+        if existing and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+        window = tk.Toplevel(self)
+        self.command_palette = window
+        window.title("搜索功能")
+        window.geometry("430x310")
+        window.configure(background=self.palette["background"])
+        window.transient(self)
+        self._set_titlebar_theme(window)
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        query = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=query)
+        entry.pack(fill=tk.X, pady=(0, 10))
+        choices = tk.Listbox(frame, activestyle="none", font=("Microsoft YaHei UI", 13),
+                              relief=tk.FLAT, highlightthickness=1)
+        choices.pack(fill=tk.BOTH, expand=True)
+        commands = (("获取小说 · 网络下载", lambda: self._select_page("download")),
+                    ("获取小说 · 本地导入", lambda: self._select_page("import")),
+                    ("翻译小说", lambda: self._select_page("translate")),
+                    ("术语管理", lambda: self._select_page("glossary")),
+                    ("检查译文", lambda: self._select_page("audit")),
+                    ("设置", self._open_settings), ("运行日志", self._toggle_log))
+        visible = []
+        def refresh(*_):
+            visible.clear()
+            choices.delete(0, tk.END)
+            term = query.get().strip().lower()
+            for label, action in commands:
+                if not term or term in label.lower():
+                    visible.append(action)
+                    choices.insert(tk.END, label)
+            if visible:
+                choices.selection_set(0)
+        def choose(_event=None):
+            selection = choices.curselection()
+            if selection:
+                action = visible[selection[0]]
+                window.destroy()
+                action()
+        query.trace_add("write", refresh)
+        entry.bind("<Return>", choose)
+        entry.bind("<Down>", lambda _: (choices.focus_set(), choices.selection_set(0)))
+        choices.bind("<Return>", choose)
+        choices.bind("<Double-Button-1>", choose)
+        window.bind("<Escape>", lambda _: window.destroy())
+        refresh()
+        entry.focus_set()
+
+    def _add_page_actions(self):
+        self.navigation_buttons = []
+        self.source_buttons = {}
+        def nav_button(parent, label, key):
+            button = ttk.Button(parent, text=label, command=lambda: self._select_page(key))
+            button.pack(side=tk.LEFT, padx=(0, 8))
+            self.navigation_buttons.append(button)
+            if key in ("download", "import"):
+                self.source_buttons.setdefault(key, []).append(button)
+
+        self.source_switch = ttk.Frame(self.tab_download)
+        self.source_switch.pack(fill=tk.X, pady=(0, 12), before=self.tab_download.winfo_children()[0])
+        nav_button(self.source_switch, "网络下载", "download")
+        nav_button(self.source_switch, "本地导入", "import")
+
+        import_switch = ttk.Frame(self.tab_import)
+        import_switch.pack(fill=tk.X, pady=(0, 12), before=self.tab_import.winfo_children()[0])
+        nav_button(import_switch, "网络下载", "download")
+        nav_button(import_switch, "本地导入", "import")
+
+        translate_actions = ttk.Frame(self.tab_translate)
+        translate_actions.pack(fill=tk.X, pady=(0, 12), before=self.tab_translate.winfo_children()[0])
+        nav_button(translate_actions, "术语管理", "glossary")
+        glossary_actions = ttk.Frame(self.tab_glossary)
+        glossary_actions.pack(fill=tk.X, pady=(0, 12), before=self.tab_glossary.winfo_children()[0])
+        nav_button(glossary_actions, "← 返回翻译", "translate")
+
+    def _select_page(self, key: str):
+        self.notebook.select(self.page_tabs[key])
+
+    def _sync_navigation(self, _event=None):
+        active = self.notebook.select()
+        if active in (str(self.tab_download), str(self.tab_import)):
+            label = "获取小说"
+        elif active in (str(self.tab_translate), str(self.tab_glossary)):
+            label = "翻译小说"
+        else:
+            label = "检查译文"
+        self.function_choice.set(label)
+        self.function_button.configure(text=f"{label} ▾")
+        for key, buttons in self.source_buttons.items():
+            for button in buttons:
+                button.configure(style="SourceSelected.TButton" if active == str(self.page_tabs[key]) else "TButton")
+        self._update_current_work()
 
     def _toggle_log(self):
+        self.log_toggle.configure(text="运行日志")
         if self.log_panel.winfo_manager():
             self.log_panel.pack_forget()
-            self.log_toggle.configure(text="顯示日誌")
+            self.log_toggle.configure(text="运行日志")
         else:
             self.log_panel.pack(fill=tk.X)
-            self.log_toggle.configure(text="收合日誌")
+            self.log_toggle.configure(text="收起日志")
             self.log_text.see(tk.END)
+
+    def _update_current_work(self):
+        active = self.notebook.select()
+        path = ""
+        if active == str(self.tab_translate) and hasattr(self, "tr_epub_var"):
+            path = self.tr_epub_var.get().strip()
+        elif active == str(self.tab_glossary) and hasattr(self, "proj_dir_var"):
+            path = self.proj_dir_var.get().strip()
+        elif active == str(self.tab_audit) and hasattr(self, "audit_proj_var"):
+            path = self.audit_proj_var.get().strip()
+        elif active == str(self.tab_download) and getattr(self, "current_work", None):
+            path = self.current_work.title
+        elif active == str(self.tab_import) and hasattr(self, "import_title_var"):
+            path = self.import_title_var.get().strip()
+        name = Path(path).stem if path else ""
+        self.current_work_var.set(f"{name[:28]}{'…' if len(name) > 28 else ''}" if name else "")
+
+    def _save_preferences(self):
+        config = load_json(CONFIG_PATH, {})
+        config["ui_theme"] = self.ui_theme
+        atomic_json(CONFIG_PATH, config)
+
+    def _open_settings(self):
+        window = tk.Toplevel(self)
+        window.title("设置")
+        window.geometry("480x350")
+        window.resizable(False, False)
+        window.configure(background=self.palette["background"])
+        self._set_titlebar_theme(window)
+        frame = ttk.Frame(window, padding=24)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        ttk.Label(frame, text="模型与连接", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor=tk.W, pady=(0, 14))
+        ttk.Label(frame, text="翻译模型").pack(anchor=tk.W)
+        model_var = tk.StringVar(value=self.tr_model_var.get())
+        model_box = ttk.Combobox(frame, textvariable=model_var,
+                                 values=list(TRANSLATION_MODELS.values()), state="readonly")
+        model_box.pack(fill=tk.X, pady=(4, 12))
+        ttk.Label(frame, text="Ollama 地址").pack(anchor=tk.W)
+        url_var = tk.StringVar(value=self.cfg["ollama_url"])
+        ttk.Entry(frame, textvariable=url_var).pack(fill=tk.X, pady=(4, 14))
+        ttk.Label(frame, text="界面主题").pack(anchor=tk.W)
+        theme_var = tk.StringVar(value="深色模式" if self.ui_theme == "dark" else "浅色模式")
+        ttk.Combobox(frame, textvariable=theme_var, values=("浅色模式", "深色模式"),
+                     state="readonly").pack(fill=tk.X, pady=(4, 8))
+
+        def save():
+            url = url_var.get().strip().rstrip("/")
+            if not re.match(r"^https?://[^\s/]+", url):
+                messagebox.showerror("地址无效", "请输入以 http:// 或 https:// 开头的 Ollama 地址。")
+                return
+            config = load_json(CONFIG_PATH, {})
+            config.update(model=model_var.get(), ollama_url=url, ui_theme=self.ui_theme)
+            atomic_json(CONFIG_PATH, config)
+            self.cfg.update(model=model_var.get(), ollama_url=url)
+            self.tr_model_var.set(model_var.get())
+            if (theme_var.get() == "深色模式") != (self.ui_theme == "dark"):
+                self._toggle_theme()
+            window.destroy()
+
+        ttk.Button(frame, text="保存设置", command=save, style="Accent.TButton").pack(anchor=tk.E, pady=(12, 0))
+
+
+    def _localize_status(self):
+        value = self.status_var.get()
+        converted = ui_text(value)
+        if converted != value:
+            self.status_var.set(converted)
 
     # ==========================================
     # Tab 1: Download Novel
@@ -339,23 +667,23 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_download
 
         # URL Frame
-        url_frame = ttk.LabelFrame(f, text="1 · 貼上作品網址", padding=10)
+        url_frame = ttk.LabelFrame(f, text="作品网址", padding=10)
         url_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(url_frame, text="小說網址：", font=("Microsoft JhengHei UI", 11, "bold")).grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(url_frame, text="网址", font=("Microsoft YaHei UI", 14, "bold")).grid(row=0, column=0, sticky=tk.W, pady=4)
         self.dl_url_var = tk.StringVar(value="https://ncode.syosetu.com/n2027ci/")
         url_entry = ttk.Entry(url_frame, textvariable=self.dl_url_var, width=65)
         url_entry.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
         url_frame.columnconfigure(1, weight=1)
 
-        btn_fetch_toc = ttk.Button(url_frame, text="讀取作品目錄", command=self._action_fetch_toc)
+        btn_fetch_toc = ttk.Button(url_frame, text="读取目录", command=self._action_fetch_toc)
         btn_fetch_toc.grid(row=0, column=2, padx=4, pady=4)
 
         # Work info display
-        info_frame = ttk.LabelFrame(f, text="2 · 選擇下載範圍", padding=10)
+        info_frame = ttk.LabelFrame(f, text="章节范围", padding=10)
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        self.dl_info_lbl = ttk.Label(info_frame, text="尚未讀取作品目錄。請輸入作品網址後點選「讀取作品目錄」。", wraplength=800)
+        self.dl_info_lbl = ttk.Label(info_frame, text="输入网址后读取目录。", wraplength=800)
         self.dl_info_lbl.pack(anchor=tk.W, pady=4)
 
         range_frame = ttk.Frame(info_frame)
@@ -373,7 +701,7 @@ class TranslatorGUI(tk.Tk):
         ttk.Label(range_frame, text="章（含起止章）").pack(side=tk.LEFT)
 
         # Chapter Listbox preview
-        self.dl_toc_listbox = tk.Listbox(info_frame, height=10, selectmode=tk.EXTENDED, font=("Microsoft JhengHei UI", 11))
+        self.dl_toc_listbox = tk.Listbox(info_frame, height=8, selectmode=tk.EXTENDED, font=("Microsoft YaHei UI", 14))
         toc_scroll = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.dl_toc_listbox.yview)
         self.dl_toc_listbox.configure(yscrollcommand=toc_scroll.set)
         toc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -422,7 +750,7 @@ class TranslatorGUI(tk.Tk):
 
     def _action_start_download(self):
         if not self.current_work:
-            messagebox.showwarning("提示", "請先點選「讀取作品目錄」。")
+            messagebox.showwarning("提示", "请先点击「读取目录」。")
             return
         try:
             start = int(self.dl_start_var.get().strip())
@@ -544,7 +872,7 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_import
 
         # Source Selection Frame
-        src_frame = ttk.LabelFrame(f, text="匯入文字或電子書 · TXT / MD / UMD / JAR", padding=10)
+        src_frame = ttk.LabelFrame(f, text="导入文件 · TXT / MD / UMD / JAR", padding=10)
         src_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(src_frame, text="檔案/資料夾：").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -554,7 +882,7 @@ class TranslatorGUI(tk.Tk):
         src_frame.columnconfigure(1, weight=1)
 
         # Merged source selection button
-        btn_src_menu = ttk.Menubutton(src_frame, text=" 📂 選擇來源 ▾ ")
+        btn_src_menu = ttk.Menubutton(src_frame, text="选择来源")
         src_menu = tk.Menu(btn_src_menu, tearoff=0)
         src_menu.add_command(label="📄 選擇文字檔 (*.txt, *.md)...", command=self._action_select_import_file)
         src_menu.add_command(label="📱 選擇 UMD 電子書 (*.umd)...", command=self._action_select_import_umd)
@@ -576,17 +904,17 @@ class TranslatorGUI(tk.Tk):
         self.import_author_var = tk.StringVar(value="未知作者")
         ttk.Entry(meta_frame, textvariable=self.import_author_var, width=12).grid(row=0, column=3, sticky=tk.W, padx=4, pady=4)
 
-        ttk.Label(meta_frame, text="檔案編碼：").grid(row=0, column=4, sticky=tk.W, padx=(8, 0), pady=4)
-        self.import_encoding_var = tk.StringVar(value="🤖 自動偵測編碼")
+        ttk.Label(meta_frame, text="檔案編碼：").grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.import_encoding_var = tk.StringVar(value="🤖 自动检测编码")
         cb_enc = ttk.Combobox(
             meta_frame,
             textvariable=self.import_encoding_var,
             values=[
-                "🤖 自動偵測編碼",
+                "🤖 自动检测编码",
                 "UTF-8",
                 "UTF-8-SIG (含BOM)",
-                "Big5 (繁體中文)",
-                "GB18030 / GBK (簡體中文)",
+                "Big5 (繁体中文)",
+                "GB18030 / GBK (简体中文)",
                 "Shift-JIS / CP932 (日文)",
                 "EUC-JP (日文)",
                 "UTF-16 LE",
@@ -595,49 +923,49 @@ class TranslatorGUI(tk.Tk):
             state="readonly",
             width=18,
         )
-        cb_enc.grid(row=0, column=5, sticky=tk.W, padx=4, pady=4)
+        cb_enc.grid(row=1, column=1, sticky=tk.W, padx=4, pady=4)
 
-        ttk.Label(meta_frame, text="章節切分規則：").grid(row=1, column=0, sticky=tk.W, pady=4)
-        self.import_rule_var = tk.StringVar(value="預設智能正則 (話/章/卷/Chapter/序章/番外等)")
+        ttk.Label(meta_frame, text="章節切分規則：").grid(row=1, column=2, sticky=tk.W, padx=(8, 0), pady=4)
+        self.import_rule_var = tk.StringVar(value="默认智能正则 (话/章/卷/Chapter/序章/番外等)")
         cb_rule = ttk.Combobox(
             meta_frame,
             textvariable=self.import_rule_var,
             values=[
-                "預設智能正則 (話/章/卷/Chapter/序章/番外等)",
-                "Markdown 標題 (#, ##)",
-                "自訂正則表達式",
+                "默认智能正则 (话/章/卷/Chapter/序章/番外等)",
+                "Markdown 标题 (#, ##)",
+                "自定义正则表达式",
             ],
             state="readonly",
-            width=32,
+            width=26,
         )
-        cb_rule.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=4, pady=4)
+        cb_rule.grid(row=1, column=3, sticky=tk.W, padx=4, pady=4)
 
-        ttk.Label(meta_frame, text="語系設定：").grid(row=1, column=3, sticky=tk.W, padx=(8, 0), pady=4)
-        self.import_lang_var = tk.StringVar(value="🤖 自動偵測語系")
+        ttk.Label(meta_frame, text="語系設定：").grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.import_lang_var = tk.StringVar(value="🤖 自动检测语系")
         cb_lang = ttk.Combobox(
             meta_frame,
             textvariable=self.import_lang_var,
             values=[
-                "🤖 自��偵測語系",
-                "🇹🇼 中文小說 (繁體中文)",
-                "🇨🇳 中文小說 (簡體中文)",
+                "🤖 自动检测语系",
+                "🇹🇼 中文小说 (繁体中文)",
+                "🇨🇳 中文小说 (简体中文)",
                 "🇯🇵 日文原文",
             ],
             state="readonly",
             width=18,
         )
-        cb_lang.grid(row=1, column=4, columnspan=2, sticky=tk.W, padx=4, pady=4)
+        cb_lang.grid(row=2, column=1, sticky=tk.W, padx=4, pady=4)
 
         self.import_sort_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(meta_frame, text="🔀 依章節序號排序", variable=self.import_sort_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Checkbutton(meta_frame, text="按章节序号排序", variable=self.import_sort_var).grid(row=2, column=2, columnspan=2, sticky=tk.W, pady=2)
 
         self.import_custom_regex_var = tk.StringVar()
         self.entry_custom_regex = ttk.Entry(meta_frame, textvariable=self.import_custom_regex_var, width=32)
-        self.entry_custom_regex.grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=4, pady=2)
+        self.entry_custom_regex.grid(row=3, column=1, columnspan=3, sticky=tk.EW, padx=4, pady=2)
         self.entry_custom_regex.grid_remove()
 
         def _on_rule_change(evt=None):
-            if self.import_rule_var.get() == "自訂正則表達式":
+            if self.import_rule_var.get() == "自定义正则表达式":
                 self.entry_custom_regex.grid()
             else:
                 self.entry_custom_regex.grid_remove()
@@ -648,7 +976,7 @@ class TranslatorGUI(tk.Tk):
         prev_frame.pack(fill=tk.BOTH, expand=True, pady=4)
 
         tree_cols = ("index", "title", "paragraphs", "chars", "url")
-        self.import_tree = ttk.Treeview(prev_frame, columns=tree_cols, show="headings", height=9)
+        self.import_tree = ttk.Treeview(prev_frame, columns=tree_cols, show="headings", height=5)
         self.import_tree.heading("index", text="序號")
         self.import_tree.heading("title", text="章節標題")
         self.import_tree.heading("paragraphs", text="段落數")
@@ -662,29 +990,32 @@ class TranslatorGUI(tk.Tk):
         self.import_tree.column("url", width=200, anchor=tk.W)
 
         tree_scroll = ttk.Scrollbar(prev_frame, orient=tk.VERTICAL, command=self.import_tree.yview)
-        self.import_tree.configure(yscrollcommand=tree_scroll.set)
-        self.import_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_x_scroll = ttk.Scrollbar(prev_frame, orient=tk.HORIZONTAL, command=self.import_tree.xview)
+        self.import_tree.configure(yscrollcommand=tree_scroll.set, xscrollcommand=tree_x_scroll.set)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.import_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.import_status_lbl = ttk.Label(f, text="請選擇檔案或資料夾後點選「預覽解析章節」。", style="Muted.TLabel")
+        self.import_status_lbl = ttk.Label(f, text="选择文件或文件夹后预览章节。", style="Muted.TLabel")
         self.import_status_lbl.pack(fill=tk.X, pady=(2, 4))
 
         # Action Buttons
         action_bar = ttk.Frame(f)
         action_bar.pack(fill=tk.X, pady=4)
 
-        ttk.Button(action_bar, text="🔍 預覽解析章節", command=self._action_import_preview).pack(side=tk.LEFT, padx=4)
-        ttk.Button(action_bar, text="✨ 掃描候選術語", command=self._action_import_extract_candidates).pack(side=tk.LEFT, padx=4)
+        ttk.Button(action_bar, text="预览章节", command=self._action_import_preview).pack(side=tk.LEFT, padx=4)
+        ttk.Button(action_bar, text="扫描术语", command=self._action_import_extract_candidates).pack(side=tk.LEFT, padx=4)
 
         # 1-Click Pack EPUB Button
-        ttk.Button(action_bar, text="📦 一鍵打包為 EPUB 電子書", command=self._action_import_to_epub).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(action_bar, text="生成 EPUB", style="Accent.TButton",
+                   command=self._action_import_to_epub).pack(side=tk.RIGHT, padx=4)
 
         # Merged Export & Processing Menu
-        btn_export_menu = ttk.Menubutton(action_bar, text=" 🚀 專案導出與處理 ▾ ")
+        btn_export_menu = ttk.Menubutton(action_bar, text="项目操作")
         export_menu = tk.Menu(btn_export_menu, tearoff=0)
-        export_menu.add_command(label="📋 導入為中文專案 (術語稽核/潤色/接續)", command=self._action_import_as_chinese_project)
-        export_menu.add_command(label="⚡ 建立專案並翻譯 (日翻中)", command=self._action_import_and_translate)
-        export_menu.add_command(label="📁 僅建立空白翻譯專案", command=self._action_import_create_project_only)
+        export_menu.add_command(label="导入为中文项目", command=self._action_import_as_chinese_project)
+        export_menu.add_command(label="建立项目并翻译", command=self._action_import_and_translate)
+        export_menu.add_command(label="仅建立空白翻译项目", command=self._action_import_create_project_only)
         btn_export_menu["menu"] = export_menu
         btn_export_menu.pack(side=tk.RIGHT, padx=4)
 
@@ -743,9 +1074,9 @@ class TranslatorGUI(tk.Tk):
 
     def _get_import_regex(self) -> str | None:
         rule = self.import_rule_var.get()
-        if rule == "Markdown 標題 (#, ##)":
+        if rule == "Markdown 标题 (#, ##)":
             return r"^\s*#{1,3}\s+(.+)$"
-        elif rule == "自訂正則表達式":
+        elif rule == "自定义正则表达式":
             custom = self.import_custom_regex_var.get().strip()
             return custom if custom else None
         return None
@@ -815,13 +1146,13 @@ class TranslatorGUI(tk.Tk):
                 ))
             detected_lang = detect_text_language(sample_paras)
             lang_label = get_language_display_name(detected_lang)
-            if self.import_lang_var.get() == "🤖 自動偵測語系":
+            if self.import_lang_var.get() == "🤖 自动检测语系":
                 if detected_lang == "ja":
                     self.import_lang_var.set("🇯🇵 日文原文")
                 elif detected_lang == "zh-Hans":
-                    self.import_lang_var.set("🇨🇳 中文小說 (簡體中文)")
+                    self.import_lang_var.set("🇨🇳 中文小说 (简体中文)")
                 else:
-                    self.import_lang_var.set("🇹🇼 中文小說 (繁體中文)")
+                    self.import_lang_var.set("🇹🇼 中文小说 (繁体中文)")
             self.import_status_lbl.config(
                 text=f"成功解析《{work.title}》（作者：{work.author}，語系：{lang_label}），共 {len(chapters)} 章，累計約 {total_chars:,} 字。"
             )
@@ -847,7 +1178,7 @@ class TranslatorGUI(tk.Tk):
         if "日" in lang_sel:
             lang_code = "日文"
             out_name = f"{safe_name(t_input)}_日文原文.epub"
-        elif "簡" in lang_sel:
+        elif "简" in lang_sel:
             lang_code = "簡體中文"
             out_name = f"{safe_name(t_input)}_中文.epub"
         elif "繁" in lang_sel:
@@ -892,7 +1223,7 @@ class TranslatorGUI(tk.Tk):
         enc = self._get_import_encoding()
         do_sort = self.import_sort_var.get()
         lang_sel = self.import_lang_var.get()
-        target_lang = "簡體中文" if "簡" in lang_sel else "繁體中文"
+        target_lang = "簡體中文" if "简" in lang_sel else "繁體中文"
 
         work_dir = Path(self.cfg.get("output_dir", "output")) / safe_name(f"{t_input}_中文專案")
         try:
@@ -921,16 +1252,16 @@ class TranslatorGUI(tk.Tk):
                 )
 
             ans = messagebox.askyesno(
-                "中文專案建立成功",
-                f"中文專案已建立完成（已載入 {len(self.imported_chapters)} 章譯文）：\n{work_dir.resolve()}\n\n是否立即切換至「一致性檢查與局部重譯」進行術語合規審核？",
+                "中文项目建立成功",
+                f"中文项目已建立完成（已载入 {len(self.imported_chapters)} 章译文）：\n{work_dir.resolve()}\n\n是否立即切换至「译文检查」？",
             )
-            self.log_text.insert(tk.END, f"已建立中文專案：{work_dir.resolve()}\n")
+            self.log_text.insert(tk.END, f"已建立中文项目：{work_dir.resolve()}\n")
             if ans:
                 self.audit_proj_var.set(str(work_dir.resolve()))
                 self.notebook.select(self.tab_audit)
                 self._action_audit_compliance()
         except Exception as exc:
-            messagebox.showerror("建立專案失敗", str(exc))
+            messagebox.showerror("建立项目失败", str(exc))
 
     def _action_import_create_project_only(self):
         if not hasattr(self, "imported_chapters") or not self.imported_chapters:
@@ -969,10 +1300,10 @@ class TranslatorGUI(tk.Tk):
                     encoding=enc,
                     sort_chapters=do_sort,
                 )
-            messagebox.showinfo("專案建立成功", f"翻譯專案已建立完成：\n{work_dir.resolve()}\n\n您可隨時切換至「本機 AI 翻譯」或「術語表管理」進行處理。")
-            self.log_text.insert(tk.END, f"已建立翻譯專案：{work_dir.resolve()}\n")
+            messagebox.showinfo("项目建立成功", f"翻译项目已建立完成：\n{work_dir.resolve()}\n\n您可随时切换至「翻译小说」或「术语管理」继续处理。")
+            self.log_text.insert(tk.END, f"已建立翻译项目：{work_dir.resolve()}\n")
         except Exception as exc:
-            messagebox.showerror("建立專案失敗", str(exc))
+            messagebox.showerror("建立项目失败", str(exc))
 
     def _action_import_and_translate(self):
         if not hasattr(self, "imported_chapters") or not self.imported_chapters:
@@ -1073,28 +1404,29 @@ class TranslatorGUI(tk.Tk):
         btn_box.pack(fill=tk.X, pady=(0, 6))
 
         # Term editing actions
-        ttk.Button(btn_box, text="➕ 新增術語", command=self._action_add_term).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="✏️ 編輯選中", command=self._action_edit_term).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_box, text="🗑️ 刪除選中", command=self._action_delete_term).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_box, text="新增术语", command=self._action_add_term).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_box, text="编辑选中", command=self._action_edit_term).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_box, text="删除选中", command=self._action_delete_term).pack(side=tk.LEFT, padx=3)
         ttk.Separator(btn_box, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         # Merged Extraction & Recognition Menu
-        btn_extract_menu = ttk.Menubutton(btn_box, text=" 🔍 術語提取/識別 ▾ ")
+        btn_extract_menu = ttk.Menubutton(btn_box, text="提取术语")
         extract_menu = tk.Menu(btn_extract_menu, tearoff=0)
-        extract_menu.add_command(label="⚡ 快速提取候選術語 (秒級統計)", command=self._action_extract_candidates_gui)
-        extract_menu.add_command(label="🤖 AI 深度實體識別 (Ollama)", command=self._action_ai_scan_entities_gui)
+        extract_menu.add_command(label="快速提取候选术语", command=self._action_extract_candidates_gui)
+        extract_menu.add_command(label="模型识别实体 (Ollama)", command=self._action_ai_scan_entities_gui)
         btn_extract_menu["menu"] = extract_menu
         btn_extract_menu.pack(side=tk.LEFT, padx=2)
 
         # Merged Import & Export Menu
-        btn_io_menu = ttk.Menubutton(btn_box, text=" 📁 匯入/匯出 ▾ ")
+        btn_io_menu = ttk.Menubutton(btn_box, text="导入与导出")
         io_menu = tk.Menu(btn_io_menu, tearoff=0)
-        io_menu.add_command(label="📥 匯入術語表 (CSV / Excel / JSON)...", command=self._action_import_glossary_gui)
-        io_menu.add_command(label="📤 匯出術語表 (Excel / CSV / JSON)...", command=self._action_export_glossary_gui)
+        io_menu.add_command(label="导入术语表 (CSV / Excel / JSON)", command=self._action_import_glossary_gui)
+        io_menu.add_command(label="导出术语表 (Excel / CSV / JSON)", command=self._action_export_glossary_gui)
         btn_io_menu["menu"] = io_menu
         btn_io_menu.pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(btn_box, text="💾 儲存更新", command=self._action_save_glossary_gui).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn_box, text="保存更改", style="Accent.TButton",
+                   command=self._action_save_glossary_gui).pack(side=tk.RIGHT, padx=3)
 
         # Table (Treeview)
         table_frame = ttk.Frame(f)
@@ -1102,7 +1434,7 @@ class TranslatorGUI(tk.Tk):
 
         columns = ("source", "target", "category", "note")
         self.glossary_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
-        self.glossary_tree.heading("source", text="日文原文 (Source)")
+        self.glossary_tree.heading("source", text="原文")
         self.glossary_tree.heading("target", text="中文譯名 (Target)")
         self.glossary_tree.heading("category", text="類別 (Category)")
         self.glossary_tree.heading("note", text="備註說明 (Note)")
@@ -1113,8 +1445,10 @@ class TranslatorGUI(tk.Tk):
         self.glossary_tree.column("note", width=300, anchor=tk.W)
 
         tree_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.glossary_tree.yview)
-        self.glossary_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.glossary_tree.xview)
+        self.glossary_tree.configure(yscrollcommand=tree_scroll.set, xscrollcommand=tree_x_scroll.set)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.glossary_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.glossary_tree.bind("<Double-1>", lambda *_: self._action_edit_term())
@@ -1123,7 +1457,7 @@ class TranslatorGUI(tk.Tk):
         self._refresh_glossary_table()
 
     def _action_select_glossary_project(self):
-        selected = filedialog.askdirectory(title="選擇作品專案資料夾", initialdir=self.cfg.get("output_dir", "output"))
+        selected = filedialog.askdirectory(title="选择作品项目文件夹", initialdir=self.cfg.get("output_dir", "output"))
         if selected:
             self.proj_dir_var.set(selected)
             self.glossary_scope_var.set("project")
@@ -1197,6 +1531,7 @@ class TranslatorGUI(tk.Tk):
 
     def _term_edit_dialog(self, entry: GlossaryEntry | None):
         dialog = tk.Toplevel(self)
+        dialog.after_idle(lambda: self._set_titlebar_theme(dialog))
         dialog.title("新增/編輯術語" if entry else "新增術語")
         dialog.geometry("450x260")
         dialog.transient(self)
@@ -1205,7 +1540,7 @@ class TranslatorGUI(tk.Tk):
         frm = ttk.Frame(dialog, padding=15)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frm, text="日文原文：").grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(frm, text="原文：").grid(row=0, column=0, sticky=tk.W, pady=4)
         src_var = tk.StringVar(value=entry.source if entry else "")
         entry_src = ttk.Entry(frm, textvariable=src_var, width=32)
         entry_src.grid(row=0, column=1, sticky=tk.EW, pady=4)
@@ -1231,7 +1566,7 @@ class TranslatorGUI(tk.Tk):
             c = cat_var.get().strip()
             n = note_var.get().strip()
             if not s or not t:
-                messagebox.showerror("錯誤", "日文原文與中文譯名皆不可為空。")
+                messagebox.showerror("错误", "原文与译名都不能为空。")
                 return
             new_e = GlossaryEntry(source=s, target=t, category=c, note=n)
             # update
@@ -1345,6 +1680,7 @@ class TranslatorGUI(tk.Tk):
 
     def _candidate_review_dialog(self, candidates: list[CandidateTerm] | list[GlossaryEntry]):
         dialog = tk.Toplevel(self)
+        dialog.after_idle(lambda: self._set_titlebar_theme(dialog))
         dialog.title(f"候選專有名詞確認與審核（共 {len(candidates)} 筆）")
         dialog.geometry("820x540")
         dialog.transient(self)
@@ -1357,7 +1693,7 @@ class TranslatorGUI(tk.Tk):
 
         cols = ("source", "target", "category", "count", "note")
         tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="extended")
-        tree.heading("source", text="日文原文")
+        tree.heading("source", text="原文")
         tree.heading("target", text="中文推薦譯名")
         tree.heading("category", text="類別")
         tree.heading("count", text="出現頻次")
@@ -1404,9 +1740,7 @@ class TranslatorGUI(tk.Tk):
         f = self.tab_translate
 
         # Source Selection
-        ttk.Label(f, text="選擇原文與翻譯模型，即可開始。已完成的進度會自動接續。",
-                  style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 12))
-        src_frame = ttk.LabelFrame(f, text="1 · 選擇日文 EPUB", padding=14)
+        src_frame = ttk.LabelFrame(f, text="日文 EPUB", padding=12)
         src_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(src_frame, text="日文 EPUB 檔案：").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -1418,19 +1752,19 @@ class TranslatorGUI(tk.Tk):
         ttk.Button(src_frame, text="選擇 EPUB...", command=self._action_select_tr_epub).grid(row=0, column=2, padx=4, pady=4)
 
         # Target Language & Translation Mode
-        opt_frame = ttk.LabelFrame(f, text="2 · 選擇輸出語言與模型", padding=14)
+        opt_frame = ttk.LabelFrame(f, text="输出语言与模型", padding=12)
         opt_frame.pack(fill=tk.X, pady=(4, 8))
         language_row = ttk.Frame(opt_frame)
         language_row.pack(fill=tk.X, pady=(0, 12))
 
         self.tr_language_vars = {}
         for index, (code, (label, _)) in enumerate(LANGUAGES.items()):
-            variable = tk.BooleanVar(value=code == "zh-Hant")
+            variable = tk.BooleanVar(value=code == "zh-Hans")
             self.tr_language_vars[code] = variable
             ttk.Checkbutton(language_row, text=label, variable=variable).grid(
                 row=index // 4, column=index % 4, sticky=tk.W, padx=(0, 18), pady=3)
-        ttk.Label(opt_frame, text="可多選，每種語言獨立輸出；中文標題與正文會自動統一簡繁。",
-                  style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(opt_frame, text="可多选；每种语言生成独立 EPUB。",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 6))
 
         self.tr_model_var = tk.StringVar(value=self.cfg["model"])
         for label, model in TRANSLATION_MODELS.items():
@@ -1519,63 +1853,201 @@ class TranslatorGUI(tk.Tk):
     # ==========================================
     def _setup_tab_audit(self):
         f = self.tab_audit
-
-        top_f = ttk.LabelFrame(f, text="作品專案與合規性稽核", padding=10)
-        top_f.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(top_f, text="專案資料夾：").grid(row=0, column=0, sticky=tk.W, pady=4)
         self.audit_proj_var = tk.StringVar()
-        entry_proj = ttk.Entry(top_f, textvariable=self.audit_proj_var, width=55)
-        entry_proj.grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
-        top_f.columnconfigure(1, weight=1)
-
-        ttk.Button(top_f, text="選擇專案...", command=self._action_select_audit_proj).grid(row=0, column=2, padx=4, pady=4)
-        ttk.Button(top_f, text="檢查術語與譯文", command=self._action_audit_compliance).grid(row=0, column=3, padx=4, pady=4)
-
-        # Violations Table
-        lbl_v = ttk.Label(f, text="術語與譯文警示（請人工核對）：", font=("Microsoft JhengHei UI", 11, "bold"))
-        lbl_v.pack(anchor=tk.W, pady=(4, 2))
-
-        v_frame = ttk.Frame(f)
-        v_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
-        v_cols = ("chapter", "para", "category", "source", "expected", "original", "translated")
-        self.violation_tree = ttk.Treeview(v_frame, columns=v_cols, show="headings", selectmode="extended")
-        self.violation_tree.heading("chapter", text="章節")
-        self.violation_tree.heading("para", text="段落")
-        self.violation_tree.heading("category", text="分類")
-        self.violation_tree.heading("source", text="日文原文")
-        self.violation_tree.heading("expected", text="應譯為")
-        self.violation_tree.heading("original", text="原文片段")
-        self.violation_tree.heading("translated", text="譯文片段")
-
-        self.violation_tree.column("chapter", width=120)
-        self.violation_tree.column("para", width=60, anchor=tk.CENTER)
-        self.violation_tree.column("category", width=90, anchor=tk.CENTER)
-        self.violation_tree.column("source", width=130)
-        self.violation_tree.column("expected", width=130)
-        self.violation_tree.column("original", width=220)
-        self.violation_tree.column("translated", width=220)
-
-        v_scroll = ttk.Scrollbar(v_frame, orient=tk.VERTICAL, command=self.violation_tree.yview)
-        self.violation_tree.configure(yscrollcommand=v_scroll.set)
-        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.violation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Local Re-translation box
-        re_box = ttk.LabelFrame(f, text="按術語影響範圍局部重譯 (免全本重翻)", padding=10)
-        re_box.pack(fill=tk.X, pady=(0, 4))
-
-        ttk.Label(re_box, text="指定日文術語：").pack(side=tk.LEFT)
         self.re_terms_var = tk.StringVar()
-        entry_terms = ttk.Entry(re_box, textvariable=self.re_terms_var, width=35)
-        entry_terms.pack(side=tk.LEFT, padx=6)
-        ttk.Label(re_box, text="(多個術語以逗號分隔，或輸入 'all')").pack(side=tk.LEFT)
+        self.re_all_var = tk.BooleanVar(value=False)
+        self.audit_items = {}
+        self.audit_state_var = tk.StringVar(value="尚未检查")
+        self.audit_name_var = tk.StringVar(value="未选择项目")
+        self.audit_path_var = tk.StringVar(value="")
 
-        ttk.Button(re_box, text="分析影響範圍並局部重譯", command=self._action_scope_retranslate_gui).pack(side=tk.RIGHT, padx=4)
+        ttk.Label(f, text="译文检查", style="Title.TLabel").pack(anchor=tk.W, pady=(0, 2))
+        ttk.Label(f, text="检查术语一致性与潜在翻译问题", style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 14))
+        project_row = ttk.Frame(f)
+        project_row.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(project_row, textvariable=self.audit_name_var,
+                  font=("Microsoft YaHei UI", 14, "bold")).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.audit_start_button = ttk.Button(project_row, text="开始检查", style="Accent.TButton",
+                                              command=self._action_audit_compliance, state=tk.DISABLED)
+        self.audit_start_button.pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(project_row, text="选择项目", command=self._action_select_audit_proj).pack(side=tk.RIGHT)
+        self.audit_path_label = ttk.Label(f, textvariable=self.audit_path_var, style="Muted.TLabel")
+        self.audit_path_label.pack(anchor=tk.W, fill=tk.X, pady=(0, 12))
+        self.audit_path_label.bind("<Enter>", self._show_audit_path_tip)
+        self.audit_path_label.bind("<Leave>", self._hide_audit_path_tip)
+        ttk.Label(f, textvariable=self.audit_state_var, style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 8))
+
+        self.audit_empty = ttk.Frame(f)
+        self.audit_empty.pack(fill=tk.BOTH, expand=True)
+        empty_center = ttk.Frame(self.audit_empty)
+        empty_center.place(relx=.5, rely=.42, anchor=tk.CENTER)
+        self.audit_empty_var = tk.StringVar(value="选择翻译项目，检查术语一致性与译文问题")
+        ttk.Label(empty_center, textvariable=self.audit_empty_var,
+                  style="Muted.TLabel").pack(pady=(0, 12))
+        ttk.Button(empty_center, text="选择项目", command=self._action_select_audit_proj).pack()
+
+        self.audit_results = ttk.Frame(f)
+        list_frame = ttk.Frame(self.audit_results)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        columns = ("position", "type", "summary", "status")
+        self.violation_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse", height=7)
+        for key, label, width, stretch in (("position", "位置", 180, False),
+                                            ("type", "问题类型", 125, False),
+                                            ("summary", "问题摘要", 380, True),
+                                            ("status", "处理状态", 100, False)):
+            self.violation_tree.heading(key, text=label)
+            self.violation_tree.column(key, width=width, minwidth=width if not stretch else 180,
+                                       stretch=stretch, anchor=tk.W)
+        scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.violation_tree.yview)
+        self.violation_tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.violation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.violation_tree.bind("<<TreeviewSelect>>", self._show_audit_detail)
+
+        self.audit_detail = ttk.Frame(self.audit_results)
+        ttk.Separator(self.audit_detail).pack(fill=tk.X, pady=(0, 8))
+        self.audit_detail_text = tk.Text(self.audit_detail, height=7, wrap=tk.WORD,
+                                          font=("Microsoft YaHei UI", 12), state=tk.DISABLED,
+                                          relief=tk.FLAT, padx=8, pady=6)
+        self.audit_detail_text.pack(fill=tk.BOTH, expand=True)
+        detail_actions = ttk.Frame(self.audit_detail)
+        detail_actions.pack(fill=tk.X, pady=(7, 0))
+        ttk.Button(detail_actions, text="标记已处理", command=lambda: self._set_audit_item_status("已处理"))\
+            .pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(detail_actions, text="忽略", command=lambda: self._set_audit_item_status("已忽略"))\
+            .pack(side=tk.LEFT)
+        ttk.Button(detail_actions, text="重译此段", command=self._retranslate_selected_paragraph)\
+            .pack(side=tk.RIGHT)
+        ttk.Button(detail_actions, text="更多操作", command=self._open_audit_more)\
+            .pack(side=tk.RIGHT, padx=(0, 8))
+        self.audit_proj_var.trace_add("write", lambda *_: self._on_audit_project_change())
+
+    def _on_audit_project_change(self):
+        path = self.audit_proj_var.get().strip()
+        self.audit_name_var.set(Path(path).name if path else "未选择项目")
+        self.audit_path_var.set(path if len(path) <= 90 else f"{path[:42]}…{path[-42:]}")
+        self.audit_start_button.configure(state=tk.NORMAL if path else tk.DISABLED)
+        self.audit_state_var.set("尚未检查")
+        self.audit_empty_var.set("点击“开始检查”，查看术语一致性与译文问题" if path else
+                                 "选择翻译项目，检查术语一致性与译文问题")
+        self.audit_results.pack_forget()
+        self.audit_detail.pack_forget()
+        self.audit_empty.pack(fill=tk.BOTH, expand=True)
+        for item in self.violation_tree.get_children():
+            self.violation_tree.delete(item)
+        self.audit_items.clear()
+
+    def _show_audit_path_tip(self, event):
+        path = self.audit_proj_var.get().strip()
+        if not path or path == self.audit_path_var.get():
+            return
+        tip = tk.Toplevel(self)
+        tip.overrideredirect(True)
+        tip.geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+        ttk.Label(tip, text=path, padding=6).pack()
+        self.audit_path_tip = tip
+
+    def _hide_audit_path_tip(self, _event=None):
+        tip = getattr(self, "audit_path_tip", None)
+        if tip and tip.winfo_exists():
+            tip.destroy()
+        self.audit_path_tip = None
+
+    def _audit_item_key(self, chapter, violation):
+        return f"{chapter}\u0000{violation.paragraph_index}\u0000{violation.category}\u0000{violation.source}"
+
+    def _show_audit_detail(self, _event=None):
+        selected = self.violation_tree.selection()
+        if not selected:
+            self.audit_detail.pack_forget()
+            return
+        chapter, violation = self.audit_items[selected[0]]
+        reason = violation.suggested_fix or (
+            f"原文包含“{violation.source}”，建议译为“{violation.expected_target}”。"
+            if violation.source else "请人工核对这一段的译文。")
+        content = (f"位置：{chapter} · 第 {violation.paragraph_index} 段\n"
+                   f"原文：{violation.original_text}\n"
+                   f"译文：{violation.translated_text}\n"
+                   f"建议译法：{violation.expected_target or '—'}\n"
+                   f"问题原因：{reason}")
+        self.audit_detail_text.configure(state=tk.NORMAL)
+        self.audit_detail_text.delete("1.0", tk.END)
+        self.audit_detail_text.insert("1.0", content)
+        self.audit_detail_text.configure(state=tk.DISABLED)
+        if not self.audit_detail.winfo_manager():
+            self.audit_detail.pack(fill=tk.X)
+
+    def _set_audit_item_status(self, status):
+        selected = self.violation_tree.selection()
+        if not selected:
+            return
+        item = selected[0]
+        values = list(self.violation_tree.item(item, "values"))
+        values[3] = status
+        self.violation_tree.item(item, values=values)
+        chapter, violation = self.audit_items[item]
+        path = Path(self.audit_proj_var.get().strip()) / "audit-status.json"
+        saved = load_json(path, {})
+        saved[self._audit_item_key(chapter, violation)] = status
+        atomic_json(path, saved)
+        self._update_audit_count()
+
+    def _update_audit_count(self):
+        total = len(self.violation_tree.get_children())
+        pending = sum(self.violation_tree.set(item, "status") == "待核对"
+                      for item in self.violation_tree.get_children())
+        self.audit_state_var.set(f"发现 {pending} 项待核对（共 {total} 项）" if total else "未发现问题")
+
+    def _retranslate_selected_paragraph(self):
+        selected = self.violation_tree.selection()
+        if not selected:
+            return
+        chapter, violation = self.audit_items[selected[0]]
+        path = Path(self.audit_proj_var.get().strip())
+        if not messagebox.askyesno("重译此段", f"将重新翻译《{chapter}》第 {violation.paragraph_index} 段并更新 EPUB，继续？"):
+            return
+        self.stop_requested = False
+        task_cfg = dict(self.cfg)
+        task_cfg["_translation_cancelled"] = lambda: self.stop_requested
+        self._set_busy(True, "正在重译选中段落……")
+        self.btn_stop.config(state=tk.NORMAL)
+        location = (chapter, violation.paragraph_index, violation.original_text)
+
+        def progress(percent, title):
+            self.log_queue.put(("progress", percent))
+            self.log_queue.put(("status", title))
+
+        def worker():
+            try:
+                ensure_model(task_cfg, interactive=False)
+                output = retranslate_project(path, task_cfg, [], progress,
+                                             paragraph_location=location)
+                self.log_queue.put(("retranslate_complete", str(output)))
+            except TranslationCancelled:
+                self.log_queue.put(("translate_stopped", None))
+            except Exception as exc:
+                self.log_queue.put(("error", f"段落重译失败：{exc}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_audit_more(self):
+        window = tk.Toplevel(self)
+        window.title("更多操作 · 局部重译")
+        window.geometry("460x205")
+        window.configure(background=self.palette["background"])
+        self._set_titlebar_theme(window)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        ttk.Label(frame, text="指定术语（多个术语用逗号分隔）").pack(anchor=tk.W)
+        ttk.Entry(frame, textvariable=self.re_terms_var).pack(fill=tk.X, pady=(6, 10))
+        ttk.Checkbutton(frame, text="全部术语", variable=self.re_all_var).pack(anchor=tk.W)
+        def run():
+            window.destroy()
+            self._action_scope_retranslate_gui()
+        ttk.Button(frame, text="分析范围并局部重译", command=run,
+                   style="Accent.TButton").pack(anchor=tk.E, pady=(10, 0))
 
     def _action_select_audit_proj(self):
-        fpath = filedialog.askdirectory(title="選擇作品專案資料夾", initialdir=self.cfg.get("output_dir", "output"))
+        fpath = filedialog.askdirectory(title="选择作品项目文件夹", initialdir=self.cfg.get("output_dir", "output"))
         if fpath:
             self.audit_proj_var.set(fpath)
 
@@ -1589,7 +2061,10 @@ class TranslatorGUI(tk.Tk):
             return load_review_project(path, Path(source))
 
     def _action_audit_compliance(self):
-        path = Path(self.audit_proj_var.get().strip())
+        path_text = self.audit_proj_var.get().strip()
+        if not path_text:
+            return
+        path = Path(path_text)
         try:
             project = self._load_review_project(path)
             if project is None:
@@ -1598,9 +2073,16 @@ class TranslatorGUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("项目错误", str(exc))
             return
-        self._set_busy(True, "正在稽核术语……")
+        self._set_busy(True, "正在检查术语与译文……")
+        self.audit_state_var.set("检查中")
+        self.audit_empty_var.set("正在检查，请稍候…")
+        self.audit_results.pack_forget()
+        self.audit_empty.pack(fill=tk.BOTH, expand=True)
         for item in self.violation_tree.get_children():
             self.violation_tree.delete(item)
+        self.audit_items.clear()
+        self.audit_detail.pack_forget()
+        self.audit_saved_status = load_json(path / "audit-status.json", {})
 
         def _worker():
             try:
@@ -1609,14 +2091,16 @@ class TranslatorGUI(tk.Tk):
                     self.log_queue.put(("violation", (title, violation)))
                 self.log_queue.put(("audit_complete", len(results)))
             except Exception as exc:
-                self.log_queue.put(("error", f"稽核失败：{exc}"))
+                self.log_queue.put(("error", f"检查失败：{exc}"))
         threading.Thread(target=_worker, daemon=True).start()
 
     def _action_scope_retranslate_gui(self):
         path = Path(self.audit_proj_var.get().strip())
         value = self.re_terms_var.get().strip()
+        if self.re_all_var.get():
+            value = "all"
         if not value:
-            messagebox.showwarning("提示", "请输入需要重译的原文术语。")
+            messagebox.showwarning("提示", "请输入需要重译的术语，或选择“全部术语”。")
             return
         try:
             project = self._load_review_project(path)
@@ -1665,7 +2149,10 @@ class TranslatorGUI(tk.Tk):
 
             def disable(parent):
                 for widget in parent.winfo_children():
-                    if isinstance(widget, (ttk.Button, tk.Button)) and widget not in (self.log_toggle, self.theme_button):
+                    if (isinstance(widget, (ttk.Button, tk.Button))
+                            and widget not in (self.log_toggle, self.function_button,
+                                               self.search_button, self.settings_button)
+                            and widget not in self.navigation_buttons):
                         self._busy_button_states.append((widget, str(widget.cget("state"))))
                         widget.configure(state=tk.DISABLED)
                     disable(widget)
@@ -1706,8 +2193,12 @@ class TranslatorGUI(tk.Tk):
                 elif msg_type == "error":
                     self._set_busy(False)
                     self.status_var.set("執行未完成 · 請查看日誌")
+                    if self.audit_state_var.get() == "检查中":
+                        self.audit_state_var.set("检查失败")
+                        self.audit_empty_var.set("检查失败，请查看运行日志后重试")
                     if not self.log_panel.winfo_manager():
                         self._toggle_log()
+                    self.log_toggle.configure(text="运行日志 ·")
                     self.log_text.insert(tk.END, f"[錯誤] {payload}\n")
                     self.log_text.see(tk.END)
                     messagebox.showerror("執行錯誤", payload)
@@ -1715,6 +2206,7 @@ class TranslatorGUI(tk.Tk):
                     self._set_busy(False)
                     work: WorkInfo = payload
                     self.current_work = work
+                    self._update_current_work()
                     self.dl_info_lbl.config(
                         text=f"作品：{work.title} | 作者：{work.author or '未提供'} | 可訪問章節：{len(work.episodes)} 章"
                     )
@@ -1741,19 +2233,26 @@ class TranslatorGUI(tk.Tk):
                     self._candidate_review_dialog(payload)
                 elif msg_type == "violation":
                     ch_title, v = payload
-                    self.violation_tree.insert("", tk.END, values=(
-                        ch_title, v.paragraph_index, v.category, v.source, v.expected_target,
-                        v.original_text[:50], v.translated_text[:50]
-                    ))
+                    summary = (f"{v.source} → {v.expected_target}" if v.source else
+                               (v.suggested_fix or v.translated_text or v.original_text))
+                    status = self.audit_saved_status.get(self._audit_item_key(ch_title, v), "待核对")
+                    item = self.violation_tree.insert("", tk.END, values=(
+                        f"{ch_title} · {v.paragraph_index}", v.category,
+                        summary[:90], status))
+                    self.audit_items[item] = (ch_title, v)
                 elif msg_type == "audit_complete":
                     self._set_busy(False)
-                    total_v = payload
-                    if total_v == 0:
-                        messagebox.showinfo("譯文檢查結果", "未發現術語或譯文警示。")
+                    self._update_audit_count()
+                    if payload:
+                        self.audit_empty.pack_forget()
+                        self.audit_results.pack(fill=tk.BOTH, expand=True)
                     else:
-                        messagebox.showwarning("譯文檢查結果", f"檢查完成，共發現 {total_v} 處警示，請人工核對。")
+                        self.audit_empty_var.set("未发现问题")
                 elif msg_type == "retranslate_complete":
                     self._set_busy(False)
+                    self._on_audit_project_change()
+                    self.audit_state_var.set("译文已更新 · 请重新检查")
+                    self.audit_empty_var.set("译文已更新，请重新检查以刷新问题列表")
                     self.log_text.insert(tk.END, f"局部重譯完成！EPUB 已更新：{payload}\n")
                     messagebox.showinfo("局部重譯完成", f"受影響章節已局部重譯完成，EPUB 電子書已更新：\n{payload}")
         except queue.Empty:

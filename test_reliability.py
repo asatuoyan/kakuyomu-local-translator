@@ -156,6 +156,18 @@ class ProjectCompatibilityTests(unittest.TestCase):
             self.assertNotIn("chapters", manifest)
             self.assertEqual(manifest["chapter_count"], 1)
 
+    def test_selected_paragraph_retranslation_changes_only_that_paragraph(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.make_book(root)
+            with patch("main.translate_chunk", return_value=["updated"]) as translate:
+                main.retranslate_project(root, {"model": "test"}, [],
+                                         paragraph_location=("Title", 2, "unchanged"))
+            translate.assert_called_once()
+            self.assertEqual(translate.call_args.args[0], ["unchanged"])
+            self.assertEqual(main.load_review_project(root)["chapters"][0]["paragraphs"],
+                             ["wrong", "updated"])
+
     def test_legacy_translation_project_recovers_original_and_preserves_backup(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)

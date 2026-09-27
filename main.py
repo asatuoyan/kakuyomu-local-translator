@@ -1155,7 +1155,9 @@ def audit_project(project: dict, entries: list) -> list:
             raise ValueError(f"章节《{chapter.get('title', '')}》缺少完整的原文/译文对应关系，不能判定稽核通过。")
         violations, _ = check_glossary_compliance(source, target, entries)
         results.extend((chapter.get("title", ""), violation) for violation in violations)
-        if language_code(project.get("language", "")) != "ja":
+        # Older projects may not record an output language. Keep their glossary
+        # audit available without guessing which translation checks apply.
+        if project.get("language") and language_code(project["language"]) != "ja":
             results.extend((chapter.get("title", ""), warning)
                            for warning in check_translation_quality(source, target))
     return results
@@ -1194,12 +1196,26 @@ def rebuild_project(work_dir: Path, project: dict) -> Path:
     return output
 
 
-def retranslate_project(work_dir: Path, cfg: dict, terms: list[str], progress=None) -> Path:
+def retranslate_project(work_dir: Path, cfg: dict, terms: list[str], progress=None,
+                        *, paragraph_location: tuple[str, int, str] | None = None) -> Path:
     project = load_review_project(work_dir)
     local = dict(cfg)
     local["target_language"] = project.get("language", cfg.get("target_language", "繁體中文"))
     local["glossary"] = entries_to_dict(project_glossary(cfg, work_dir, project))
-    affected = find_affected_chapters(project["chapters"], terms)
+    if paragraph_location is None:
+        affected = find_affected_chapters(project["chapters"], terms)
+    else:
+        chapter_title, paragraph_number, original_text = paragraph_location
+        matches = []
+        for chapter_index, chapter in enumerate(project["chapters"], 1):
+            source = chapter.get("source_paragraphs") or chapter.get("japanese", [])
+            if (chapter.get("title") == chapter_title
+                    and 1 <= paragraph_number <= len(source)
+                    and source[paragraph_number - 1] == original_text):
+                matches.append(chapter_index)
+        if len(matches) != 1:
+            raise ValueError("无法唯一定位要重译的段落，请重新检查项目。")
+        affected = [{"index": matches[0], "affected_paragraphs": [paragraph_number - 1]}]
     for number, item in enumerate(affected, 1):
         check_translation_cancelled(local)
         index = item["index"] - 1
