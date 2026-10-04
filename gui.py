@@ -82,7 +82,7 @@ from main import (
     select_active_page,
     translate_episode,
 )
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
 from epub_append import build_extended_epub, create_project_from_epub, inspect_epub
 from languages import LANGUAGES, language_name
 from gui_settings import SettingsDialog
@@ -129,6 +129,13 @@ def ui_text(value: str) -> str:
     return _ui_converter.convert(value)
 
 
+class UIStringVar(tk.StringVar):
+    """Normalize interface copy before widgets observe the new value."""
+
+    def set(self, value):
+        super().set(ui_text(value))
+
+
 class _LocalizedDialogs:
     def __init__(self, provider):
         self.provider = provider
@@ -164,6 +171,7 @@ class TextRedirector:
     def write(self, str_val: str):
         if str_val:
             self.queue.put(("log", str_val))
+        return len(str_val)
 
     def flush(self):
         pass
@@ -210,6 +218,10 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self.log_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.active_thread: threading.Thread | None = None
         self.stop_requested = False
+        self.reading_chapters = {}
+        self.reader_window = None
+        self.web_reader_server = None
+        self.reading_book = ""
         self.ui_theme = self.cfg.get("ui_theme", "light")
         if self.ui_theme not in UI_PALETTES:
             self.ui_theme = "light"
@@ -226,6 +238,33 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self.after_idle(lambda: self._set_titlebar_theme(self))
         self._localize_ui()
         self._poll_queue()
+        self.after_idle(self._discover_startup_models)
+
+    def _discover_startup_models(self):
+        from gui_settings import installed_models, apply_installed_models
+        url = self.cfg["ollama_url"]
+        results = queue.Queue(maxsize=1)
+
+        def fetch():
+            try:
+                results.put((sorted(installed_models({"ollama_url": url})), None))
+            except Exception as exc:
+                results.put(([], str(exc)))
+
+        def poll():
+            try:
+                names, error = results.get_nowait()
+            except queue.Empty:
+                self.after(100, poll)
+                return
+            if self.cfg["ollama_url"] != url:
+                return
+            apply_installed_models(self.tr_model_box, self.tr_model_var, names, self.cfg["model"])
+            if error:
+                self.log_queue.put(("log", f"读取本地模型失败：{error}\n"))
+
+        threading.Thread(target=fetch, daemon=True).start()
+        self.after(100, poll)
 
     def _set_titlebar_theme(self, window):
         """Match the Windows title bar to the selected light or dark palette."""
@@ -266,7 +305,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             if isinstance(widget, (ttk.Label, ttk.Button, ttk.Checkbutton,
                                    ttk.Radiobutton, ttk.LabelFrame, tk.Label, tk.Button)):
                 value = widget.cget("text")
-                if value:
+                if value and not ("textvariable" in widget.keys() and widget.cget("textvariable")):
                     converted = ui_text(value)
                     if converted != value:
                         widget.configure(text=converted)
@@ -344,6 +383,8 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self.style.configure("TLabelframe.Label", background=p["surface"], foreground=p["text"],
                              font=("Microsoft YaHei UI", 14, "bold"))
         self.style.configure("Muted.TLabel", foreground=p["muted"])
+        self.style.configure("Translation.TCheckbutton", font=("Microsoft YaHei UI", 12))
+        self.style.configure("Translation.TCombobox", font=("Microsoft YaHei UI", 12), padding=4)
         self.style.configure("Title.TLabel", background=p["background"],
                              font=("Microsoft YaHei UI", 24, "bold"))
         self.style.configure("Accent.TButton", background=p["accent"], foreground="#FFFFFF",
@@ -444,6 +485,12 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         }
         self.notebook.bind("<<NotebookTabChanged>>", self._sync_navigation)
 
+        self.status_var = UIStringVar(value="就绪")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="0.0%")
+        self.progress_var.trace_add(
+            "write", lambda *_: self.progress_text_var.set(f"{self.progress_var.get():.1f}%"))
+
         self._setup_tab_download()
         self._setup_tab_import()
         self._setup_tab_glossary()
@@ -455,11 +502,9 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
 
         # Bottom Global Log / Status Bar
         footer = ttk.Frame(self, style="Shell.TFrame", padding=(24, 6, 24, 14))
-        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        footer.pack(side=tk.BOTTOM, fill=tk.X, before=body)
         status_row = ttk.Frame(footer, style="Shell.TFrame")
         status_row.pack(fill=tk.X)
-        self.status_var = tk.StringVar(value="就緒")
-        self.status_var.trace_add("write", lambda *_: self._localize_status())
         self.status_bar = ttk.Label(status_row, textvariable=self.status_var,
                                     anchor=tk.W, style="Status.TLabel")
         self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -467,15 +512,23 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self.log_toggle.pack(side=tk.RIGHT, padx=(8, 0))
         self.btn_stop = ttk.Button(status_row, text="停止", command=self._action_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.RIGHT, padx=6)
-        self.progress_var = tk.DoubleVar(value=0.0)
+        self.footer_progress_text = ttk.Label(
+            status_row, textvariable=self.progress_text_var, style="Status.TLabel")
+        self.footer_progress_text.pack(side=tk.RIGHT, padx=6)
         self.progress_bar = ttk.Progressbar(footer, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=(6, 0))
-        self.log_panel = ttk.Frame(footer, style="Shell.TFrame", padding=(0, 8, 0, 0))
+        self.log_window = tk.Toplevel(self)
+        self.log_window.title("运行日志")
+        self.log_window.geometry("900x420")
+        self.log_window.withdraw()
+        self.log_window.protocol("WM_DELETE_WINDOW", self._toggle_log)
+        self.log_panel = ttk.Frame(self.log_window, padding=12)
+        self.log_panel.pack(fill=tk.BOTH, expand=True)
         bot_frame = self.log_panel
 
-        self.log_text = tk.Text(bot_frame, height=4, wrap=tk.WORD, font=("Microsoft YaHei UI", 13),
+        self.log_text = tk.Text(bot_frame, height=12, wrap=tk.WORD, font=("Microsoft YaHei UI", 13),
                                 bg=self.palette["surface"], fg=self.palette["secondary"],
-                                relief=tk.FLAT, padx=10, pady=8)
+                                relief=tk.FLAT, padx=10, pady=8, state=tk.DISABLED)
         log_scroll = ttk.Scrollbar(bot_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -509,12 +562,71 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         translate_actions = ttk.Frame(self.tab_translate)
         translate_actions.pack(fill=tk.X, pady=(0, 12), before=self.tab_translate.winfo_children()[0])
         nav_button(translate_actions, "术语管理", "glossary")
+        reader_button = ttk.Button(translate_actions, text="实时阅读", command=self._open_reader)
+        reader_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.navigation_buttons.append(reader_button)
+        web_button = ttk.Button(translate_actions, text="网页 / 手机阅读", command=self._open_web_reader)
+        web_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.navigation_buttons.append(web_button)
         glossary_actions = ttk.Frame(self.tab_glossary)
         glossary_actions.pack(fill=tk.X, pady=(0, 12), before=self.tab_glossary.winfo_children()[0])
         nav_button(glossary_actions, "← 返回翻译", "translate")
 
     def _select_page(self, key: str):
         self.notebook.select(self.page_tabs[key])
+
+    def _open_reader(self):
+        from gui_reader import LiveReader
+        if self.reader_window is None or not self.reader_window.winfo_exists():
+            self.reader_window = LiveReader(self)
+        else:
+            self.reader_window.deiconify()
+            self.reader_window.lift()
+
+    def _update_reading(self, payload):
+        language, index, title, originals, translations = payload
+        self.reading_chapters[(language, index)] = (title, originals, translations)
+        if self.web_reader_server is not None:
+            self.web_reader_server.update(payload)
+        if self.reader_window is not None and self.reader_window.winfo_exists():
+            self.reader_window.refresh()
+
+    def _open_web_reader(self):
+        import webbrowser
+        from web_reader import ReadingServer
+        if self.web_reader_server is None:
+            try:
+                self.web_reader_server = ReadingServer()
+            except OSError as exc:
+                messagebox.showerror("网页阅读启动失败", str(exc))
+                return
+            self.web_reader_server.reset(self.reading_book)
+            for (language, index), (title, originals, translations) in self.reading_chapters.items():
+                self.web_reader_server.update((language, index, title, originals, translations))
+        server = self.web_reader_server
+        dialog = tk.Toplevel(self)
+        dialog.title("网页 / 手机阅读")
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(frame, text="在电脑浏览器打开", command=lambda: webbrowser.open(server.url()),
+                   style="Accent.TButton").pack(anchor=tk.W, pady=(0, 12))
+        ttk.Label(frame, text="手机与电脑连接同一 Wi-Fi，在手机浏览器输入以下地址：").pack(anchor=tk.W)
+        for address in dict.fromkeys(server.lan_urls()) or ["未检测到局域网地址，请检查网络连接。"]:
+            address_entry = ttk.Entry(frame, width=78)
+            address_entry.insert(0, address)
+            address_entry.configure(state="readonly")
+            address_entry.pack(fill=tk.X, pady=6)
+        ttk.Label(frame, text="多个地址对应电脑的不同网卡，请选择与手机连接同一网络的 IP 地址。",
+                  wraplength=650, style="Muted.TLabel").pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(frame, text="阅读期间保持程序运行。若手机无法连接，请允许 Python 通过 Windows 防火墙的专用网络。",
+                  wraplength=650, style="Muted.TLabel").pack(anchor=tk.W, pady=(8, 0))
+        webbrowser.open(server.url())
+
+    def destroy(self):
+        if getattr(self, "web_reader_server", None) is not None:
+            self.web_reader_server.close()
+            self.web_reader_server = None
+        super().destroy()
 
     def _sync_navigation(self, _event=None):
         active = self.notebook.select()
@@ -526,6 +638,18 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             label = "检查译文"
         self.function_choice.set(label)
         self.function_button.configure(text=f"{label} ▾")
+        # The translation page already shows the shared task status and progress.
+        # Keep only the log and stop controls in its footer.
+        if hasattr(self, "footer_progress_text"):
+            if active == str(self.tab_translate):
+                self.status_bar.pack_forget()
+                self.footer_progress_text.pack_forget()
+                self.progress_bar.pack_forget()
+            else:
+                self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                     before=self.log_toggle)
+                self.footer_progress_text.pack(side=tk.RIGHT, padx=6)
+                self.progress_bar.pack(fill=tk.X, pady=(6, 0))
         for key, buttons in self.source_buttons.items():
             for button in buttons:
                 button.configure(style="SourceSelected.TButton" if active == str(self.page_tabs[key]) else "TButton")
@@ -533,12 +657,20 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
 
     def _toggle_log(self):
         self.log_toggle.configure(text="运行日志")
-        if self.log_panel.winfo_manager():
-            self.log_panel.pack_forget()
+        if self.log_window.state() != "withdrawn":
+            self.log_window.withdraw()
             self.log_toggle.configure(text="运行日志")
         else:
-            self.log_panel.pack(fill=tk.X)
+            self.log_window.deiconify()
+            self.log_window.lift()
             self.log_toggle.configure(text="收起日志")
+
+    def _append_log(self, text):
+        follow = self.log_text.yview()[1] >= 0.999
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, text)
+        self.log_text.configure(state=tk.DISABLED)
+        if follow:
             self.log_text.see(tk.END)
 
     def _update_current_work(self):
@@ -563,12 +695,6 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
     def _open_settings(self):
         SettingsDialog(self)
 
-    def _localize_status(self):
-        value = self.status_var.get()
-        converted = ui_text(value)
-        if converted != value:
-            self.status_var.set(converted)
-
     # ==========================================
     # Tab 1: Download Novel
     # ==========================================
@@ -587,6 +713,11 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
 
         btn_fetch_toc = ttk.Button(url_frame, text="读取目录", command=self._action_fetch_toc)
         btn_fetch_toc.grid(row=0, column=2, padx=4, pady=4)
+
+        ttk.Button(url_frame, text="登录 Kakuyomu", command=self._action_login).grid(
+            row=1, column=2, padx=4, pady=4)
+        ttk.Label(url_frame, text="登录后关闭浏览器，再读取目录。", style="Muted.TLabel").grid(
+            row=1, column=1, sticky=tk.W, padx=6, pady=4)
 
         # Work info display
         info_frame = ttk.LabelFrame(f, text="章节范围", padding=10)
@@ -625,6 +756,33 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
 
         self.current_work: WorkInfo | None = None
 
+    def _action_login(self):
+        self._set_busy(True, "请在浏览器中登录 Kakuyomu，完成后关闭浏览器。")
+        login_cfg = dict(self.cfg, headless=False)
+
+        def _worker():
+            try:
+                with sync_playwright() as p:
+                    ctx = _launch_context(p, login_cfg, prompt_for_cookies=False)
+                    try:
+                        page = select_active_page(ctx)
+                        page.goto("https://kakuyomu.jp/auth/login", wait_until="domcontentloaded", timeout=120_000)
+                        self.log_queue.put(("log", "请在浏览器中手动登录 Kakuyomu；完成后关闭该浏览器，登录状态会保存在本机。\n"))
+                        while ctx.pages:
+                            page = ctx.pages[0]
+                            try:
+                                page.wait_for_timeout(250)
+                            except PlaywrightError:
+                                if ctx.pages and not page.is_closed():
+                                    raise
+                    finally:
+                        ctx.close()
+                self.log_queue.put(("login_closed", None))
+            except Exception as exc:
+                self.log_queue.put(("error", f"登录浏览器打开失败：{exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _action_fetch_toc(self):
         url = self.dl_url_var.get().strip()
         if not url:
@@ -643,7 +801,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         def _worker():
             try:
                 with sync_playwright() as p:
-                    ctx = _launch_context(p, self.cfg)
+                    ctx = _launch_context(p, self.cfg, prompt_for_cookies=False)
                     page = select_active_page(ctx)
                     if "kakuyomu.jp" in work_url:
                         open_work_page(page, work_url, allow_login=True)
@@ -694,7 +852,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
                 selected = work.episodes[start - 1:end]
 
                 with sync_playwright() as p:
-                    ctx = _launch_context(p, self.cfg)
+                    ctx = _launch_context(p, self.cfg, prompt_for_cookies=False)
                     page = select_active_page(ctx)
                     if "kakuyomu.jp" in work.url:
                         open_work_page(page, work.url, allow_login=True)
@@ -1065,7 +1223,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             self.import_status_lbl.config(
                 text=f"成功解析《{work.title}》（作者：{work.author}，語系：{lang_label}），共 {len(chapters)} 章，累計約 {total_chars:,} 字。"
             )
-            self.log_text.insert(tk.END, f"批次導入解析完成：共 {len(chapters)} 章，約 {total_chars:,} 字（偵測為 {lang_label}）。\n")
+            self._append_log(f"批次导入解析完成：共 {len(chapters)} 章，约 {total_chars:,} 字（检测为 {lang_label}）。\n")
         except Exception as exc:
             messagebox.showerror("解析失敗", f"無法解析文字來源：{exc}")
 
@@ -1164,7 +1322,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
                 "中文项目建立成功",
                 f"中文项目已建立完成（已载入 {len(self.imported_chapters)} 章译文）：\n{work_dir.resolve()}\n\n是否立即切换至「译文检查」？",
             )
-            self.log_text.insert(tk.END, f"已建立中文项目：{work_dir.resolve()}\n")
+            self._append_log(f"已建立中文项目：{work_dir.resolve()}\n")
             if ans:
                 self.audit_proj_var.set(str(work_dir.resolve()))
                 self.notebook.select(self.tab_audit)
@@ -1210,7 +1368,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
                     sort_chapters=do_sort,
                 )
             messagebox.showinfo("项目建立成功", f"翻译项目已建立完成：\n{work_dir.resolve()}\n\n您可随时切换至「翻译小说」或「术语管理」继续处理。")
-            self.log_text.insert(tk.END, f"已建立翻译项目：{work_dir.resolve()}\n")
+            self._append_log(f"已建立翻译项目：{work_dir.resolve()}\n")
         except Exception as exc:
             messagebox.showerror("建立项目失败", str(exc))
 
@@ -1570,8 +1728,10 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
                 texts = []
                 for ch in chapters:
                     texts.extend(ch.paragraphs)
-                ensure_model(self.cfg, interactive=False)
-                entries = scan_novel_entities(texts, self.cfg)
+                scan_cfg = dict(self.cfg)
+                scan_cfg["model"] = scan_cfg.get("glossary_model") or scan_cfg["model"]
+                ensure_model(scan_cfg, interactive=False)
+                entries = scan_novel_entities(texts, scan_cfg)
                 self.log_queue.put(("ai_entities_ready", entries))
             except Exception as exc:
                 self.log_queue.put(("error", f"AI 識別實體失敗：{exc}"))
@@ -1638,9 +1798,10 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
     # ==========================================
     def _setup_tab_translate(self):
         f = self.tab_translate
+        f.configure(padding=12)
 
         # Source Selection
-        src_frame = ttk.LabelFrame(f, text="日文 EPUB", padding=12)
+        src_frame = ttk.LabelFrame(f, text="日文 EPUB", padding=6)
         src_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(src_frame, text="日文 EPUB 檔案：").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -1652,36 +1813,56 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         ttk.Button(src_frame, text="選擇 EPUB...", command=self._action_select_tr_epub).grid(row=0, column=2, padx=4, pady=4)
 
         # Target Language & Translation Mode
-        opt_frame = ttk.LabelFrame(f, text="输出语言与模型", padding=12)
-        opt_frame.pack(fill=tk.X, pady=(4, 8))
+        opt_frame = ttk.LabelFrame(f, text="输出语言与模型（可多选语言）", padding=8)
+        opt_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
         language_row = ttk.Frame(opt_frame)
-        language_row.pack(fill=tk.X, pady=(0, 12))
+        language_row.pack(fill=tk.X, pady=(0, 4))
 
         self.tr_language_vars = {}
         for index, (code, (label, _)) in enumerate(LANGUAGES.items()):
             variable = tk.BooleanVar(value=code == "zh-Hans")
             self.tr_language_vars[code] = variable
-            ttk.Checkbutton(language_row, text=label, variable=variable).grid(
-                row=index // 4, column=index % 4, sticky=tk.W, padx=(0, 18), pady=3)
-        ttk.Label(opt_frame, text="可多选；每种语言生成独立 EPUB。",
-                  style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 6))
+            ttk.Checkbutton(language_row, text=label, variable=variable,
+                            style="Translation.TCheckbutton").grid(
+                row=index // 4, column=index % 4, sticky=tk.W, padx=(0, 18), pady=1)
 
-        self.tr_model_var = tk.StringVar(value=self.cfg["model"])
-        ttk.Label(opt_frame, text="翻译模型").pack(anchor=tk.W, pady=(8, 4))
+        self.tr_model_var = tk.StringVar(value="")
+        model_row = ttk.Frame(opt_frame)
+        model_row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(model_row, text="翻译模型").pack(side=tk.LEFT, padx=(0, 8))
         self.tr_model_box = ttk.Combobox(
-            opt_frame, textvariable=self.tr_model_var,
-            values=list(dict.fromkeys([self.cfg["model"], *TRANSLATION_MODELS.values()])),
+            model_row, textvariable=self.tr_model_var,
+            style="Translation.TCombobox", font=("Microsoft YaHei UI", 12),
+            values=(),
+            state="readonly",
         )
-        self.tr_model_box.pack(fill=tk.X)
-        ttk.Label(opt_frame, text="可在设置中读取 Ollama 已安装模型。",
-                  style="Muted.TLabel").pack(anchor=tk.W, pady=(4, 0))
+        self.tr_model_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Progress / action buttons
-        btn_box = ttk.Frame(f)
-        btn_box.pack(fill=tk.X, pady=6)
-
-        self.btn_start_tr = ttk.Button(btn_box, text="開始翻譯", style="Accent.TButton", command=self._action_start_translate)
-        self.btn_start_tr.pack(side=tk.RIGHT, padx=4)
+        self.tr_progress_frame = ttk.LabelFrame(f, text="翻译进度", padding=6)
+        self.tr_progress_frame.pack(side=tk.BOTTOM, fill=tk.X,
+                                    pady=(8, 0), before=src_frame)
+        progress_row = ttk.Frame(self.tr_progress_frame)
+        progress_row.pack(fill=tk.X)
+        self.btn_start_tr = ttk.Button(
+            progress_row, text="开始翻译", style="Accent.TButton",
+            command=self._action_start_translate)
+        self.btn_start_tr.pack(side=tk.RIGHT, padx=(12, 0))
+        ttk.Label(progress_row, text="总进度").pack(side=tk.LEFT)
+        ttk.Label(progress_row, textvariable=self.progress_text_var).pack(side=tk.RIGHT)
+        self.tr_bilingual_var = tk.BooleanVar(value=self.cfg.get("bilingual_output", False))
+        self.tr_bilingual_check = ttk.Checkbutton(
+            progress_row, text="双语对照输出", variable=self.tr_bilingual_var)
+        self.tr_bilingual_check.pack(side=tk.LEFT, padx=12)
+        self.tr_progress_bar = ttk.Progressbar(
+            self.tr_progress_frame, variable=self.progress_var, maximum=100)
+        self.tr_progress_bar.pack(fill=tk.X, pady=(6, 8))
+        progress_status = ttk.Label(
+            self.tr_progress_frame, textvariable=self.status_var,
+            wraplength=820, style="Muted.TLabel")
+        progress_status.pack(anchor=tk.W, fill=tk.X)
+        progress_status.bind(
+            "<Configure>",
+            lambda event: progress_status.configure(wraplength=max(1, event.width)))
 
     def _action_select_tr_epub(self):
         fpath = filedialog.askopenfilename(
@@ -1708,12 +1889,22 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             return
         model = self.tr_model_var.get().strip()
         if not model:
-            messagebox.showwarning("提示", "请先选择或输入翻译模型。")
+            messagebox.showwarning("提示", "请先从下拉框选择翻译模型。")
             return
         self.cfg["model"] = model
 
         task_cfg = dict(self.cfg)
         task_cfg["_translation_cancelled"] = lambda: self.stop_requested
+        task_cfg["bilingual_output"] = self.tr_bilingual_var.get()
+        self.reading_chapters.clear()
+        self.reading_book = str(source.resolve())
+        if self.web_reader_server is not None:
+            self.web_reader_server.reset(self.reading_book)
+        if self.reader_window is not None and self.reader_window.winfo_exists():
+            self.reader_window.destroy()
+        self.reader_window = None
+        task_cfg["_reading_update"] = lambda *payload: self.log_queue.put(("reading", payload))
+        task_cfg["_translation_activity"] = lambda message: self.log_queue.put(("status", message))
         self.stop_requested = False
         self._set_busy(True, f"正在開始翻譯《{source.stem}》……")
         self.btn_stop.config(state=tk.NORMAL)
@@ -2051,7 +2242,13 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
 
 def main():
     app = TranslatorGUI()
-    app.mainloop()
+    previous_stdout, previous_stderr = sys.stdout, sys.stderr
+    redirector = TextRedirector(app.log_text, app.log_queue)
+    sys.stdout = sys.stderr = redirector
+    try:
+        app.mainloop()
+    finally:
+        sys.stdout, sys.stderr = previous_stdout, previous_stderr
 
 
 if __name__ == "__main__":

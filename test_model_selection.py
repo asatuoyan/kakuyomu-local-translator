@@ -16,7 +16,8 @@ class DirectTranslationTests(unittest.TestCase):
         payload = chat.call_args.args[0]
         self.assertNotIn("format", payload)
         self.assertEqual([m["role"] for m in payload["messages"]], ["user"])
-        self.assertTrue(payload["messages"][0]["content"].endswith("一。\n\n二。"))
+        self.assertTrue(payload["messages"][0]["content"].endswith(
+            "<source_text>\n一。\n\n二。\n</source_text>"))
 
     @patch("main.ollama_chat_content", return_value="  ")
     def test_empty_output_is_rejected(self, _chat):
@@ -31,10 +32,36 @@ class DirectTranslationTests(unittest.TestCase):
 
 
 class ModelSelectionTests(unittest.TestCase):
-    def test_installed_and_custom_models_remain_selectable(self):
+    def test_deployed_local_model_can_be_selected_without_download(self):
+        cfg = {"model": main.DEFAULT_MODEL, "ollama_url": "http://localhost:11434"}
+        with patch("builtins.input", side_effect=["3", "1"]), patch(
+            "main.installed_models", return_value={"my-translator:latest"}
+        ), patch("main.pull_model") as pull:
+            self.assertTrue(main.select_model(cfg))
+        self.assertEqual(cfg["model"], "my-translator:latest")
+        pull.assert_not_called()
+
+    def test_local_model_discovery_failure_preserves_configuration(self):
+        cfg = {"model": main.DEFAULT_MODEL}
+        with patch("builtins.input", return_value="3"), patch(
+            "main.installed_models", side_effect=RuntimeError("无法连接 Ollama")
+        ):
+            self.assertFalse(main.select_model(cfg))
+        self.assertEqual(cfg["model"], main.DEFAULT_MODEL)
+
+    def test_custom_model_name_can_be_selected(self):
+        cfg = {"model": main.DEFAULT_MODEL}
+        with patch("builtins.input", side_effect=["4", " local:custom "]), patch(
+            "main.ensure_model", return_value=True
+        ):
+            self.assertTrue(main.select_model(cfg))
+        self.assertEqual(cfg["model"], "local:custom")
+
+    def test_only_installed_models_are_selectable(self):
         choices = model_choices(["local:latest", "local:latest"], "custom:1")
-        self.assertEqual(choices[:2], ["local:latest", "custom:1"])
+        self.assertEqual(choices, ["local:latest"])
         self.assertEqual(choices.count("local:latest"), 1)
+        self.assertEqual(model_choices([], "custom:1"), [])
 
     def test_both_models_can_be_selected_without_changing_chunk_settings(self):
         for choice, model in enumerate(main.TRANSLATION_MODELS.values(), 1):

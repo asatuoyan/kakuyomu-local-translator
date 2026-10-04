@@ -6,7 +6,7 @@ import unittest
 from tkinter import ttk
 from unittest.mock import patch
 
-from gui import TranslatorGUI
+from gui import TranslatorGUI, TextRedirector
 from gui_settings import SettingsDialog
 
 
@@ -46,7 +46,108 @@ class GuiStateTests(unittest.TestCase):
         self.app.log_queue.put(("status", "正在翻译"))
         self.app._poll_queue()
         self.assertEqual(self.app.progress_var.get(), 42.0)
+        self.assertEqual(self.app.progress_text_var.get(), "42.0%")
         self.assertEqual(self.app.status_var.get(), "正在翻译")
+
+    def test_status_is_simplified_before_widgets_observe_updates(self):
+        seen = []
+        trace = self.app.status_var.trace_add("write", lambda *_: seen.append(self.app.status_var.get()))
+        try:
+            self.app.log_queue.put(("status", "簡體中文 · 章節 2/251"))
+            self.app._poll_queue()
+            self.assertEqual(seen, ["简体中文 · 章节 2/251"])
+            self.app.log_queue.put(("status", "繁體中文 · 章節 3/251"))
+            self.app._poll_queue()
+            self.assertEqual(seen[-1], "繁体中文 · 章节 3/251")
+        finally:
+            self.app.status_var.trace_remove("write", trace)
+
+    def test_log_window_does_not_shrink_translation_page(self):
+        self.app.deiconify()
+        self.addCleanup(self.app.withdraw)
+        self.app._select_page("translate")
+        self.app.geometry("980x680")
+        self.app.update()
+        height = self.app.tab_translate.winfo_height()
+        self.app._toggle_log()
+        self.app.update()
+        try:
+            self.assertEqual(self.app.tab_translate.winfo_height(), height)
+            self.assertTrue(self.app.btn_start_tr.winfo_viewable())
+            self.assertTrue(self.app.log_window.winfo_viewable())
+        finally:
+            self.app._toggle_log()
+
+    def test_log_capture_preserves_text_and_manual_scroll(self):
+        self.app.log_window.deiconify()
+        self.addCleanup(self.app.log_window.withdraw)
+        self.app._append_log("\n".join(f"line {i}" for i in range(200)) + "\n")
+        self.app.update()
+        self.app.log_text.yview_moveto(0)
+        self.app.update()
+        before = self.app.log_text.index("@0,0")
+        redirector = TextRedirector(self.app.log_text, self.app.log_queue)
+        redirector.write("批次 1/2 · C:/小說/原文.epub\n")
+        self.app._poll_queue()
+        self.app.update()
+        self.assertEqual(self.app.log_text.index("@0,0"), before)
+        self.assertIn("C:/小說/原文.epub", self.app.log_text.get("1.0", "end"))
+        self.assertEqual(str(self.app.log_text.cget("state")), "disabled")
+
+    def test_translation_progress_is_visible_at_minimum_window_size(self):
+        self.app.deiconify()
+        self.addCleanup(self.app.withdraw)
+        self.app._select_page("translate")
+        self.app.geometry("980x680")
+        self.app.update()
+        panel = self.app.tr_progress_frame
+        self.assertEqual(panel.winfo_manager(), "pack")
+        self.assertEqual(str(self.app.tr_progress_bar.cget("variable")),
+                         str(self.app.progress_var))
+        self.assertGreater(panel.winfo_height(), 50)
+        self.assertLessEqual(panel.winfo_rooty() + panel.winfo_height(),
+                             self.app.winfo_rooty() + self.app.winfo_height())
+        for widget in (self.app.btn_start_tr, self.app.tr_model_box,
+                       self.app.tr_bilingual_check):
+            self.assertTrue(widget.winfo_viewable())
+            self.assertGreater(widget.winfo_height(), 20)
+            self.assertGreaterEqual(widget.winfo_rooty(), self.app.winfo_rooty())
+            self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
+                                 self.app.winfo_rooty() + self.app.winfo_height())
+
+    def test_translation_page_does_not_duplicate_footer_progress(self):
+        self.app.deiconify()
+        self.addCleanup(self.app.withdraw)
+        self.app._select_page("translate")
+        self.app.update()
+        for widget in (self.app.status_bar, self.app.footer_progress_text,
+                       self.app.progress_bar):
+            self.assertFalse(widget.winfo_ismapped())
+        for widget in (self.app.tr_progress_frame, self.app.log_toggle, self.app.btn_stop):
+            self.assertTrue(widget.winfo_viewable())
+        self.app._select_page("download")
+        self.app.update()
+        for widget in (self.app.status_bar, self.app.footer_progress_text,
+                       self.app.progress_bar):
+            self.assertTrue(widget.winfo_viewable())
+        self.app._select_page("translate")
+        self.app.update()
+        self.assertFalse(self.app.progress_bar.winfo_ismapped())
+
+    def test_phone_reading_addresses_survive_dialog_creation(self):
+        import gc
+        addresses = ["http://192.168.1.10:12345/token/", "http://192.168.1.11:12345/token/"]
+        with patch("web_reader.ReadingServer.lan_urls", return_value=addresses), patch("webbrowser.open"):
+            self.app._open_web_reader()
+        dialog = next(child for child in self.app.winfo_children()
+                      if isinstance(child, tk.Toplevel) and child.title() == "网页 / 手机阅读")
+        self.addCleanup(dialog.destroy)
+        gc.collect()
+        self.app.update()
+        entries = [child for child in dialog.winfo_children()[0].winfo_children()
+                   if isinstance(child, ttk.Entry)]
+        self.assertEqual([entry.get() for entry in entries], addresses)
+        self.assertTrue(all(str(entry.cget("state")) == "readonly" for entry in entries))
 
     def test_settings_shows_theme_and_discovers_installed_model(self):
         with patch("gui_settings.installed_models", return_value={"local-translator:latest"}):
@@ -61,6 +162,38 @@ class GuiStateTests(unittest.TestCase):
         self.assertTrue(any(child.cget("text") == "界面主题" for child in dialog.winfo_children()[0].winfo_children()
                             if isinstance(child, ttk.Label)))
         dialog.destroy()
+
+    def test_startup_discovers_installed_models_and_clears_missing_models(self):
+        for names in ({"local:latest"}, set()):
+            with patch("gui_settings.installed_models", return_value=names):
+                self.app._discover_startup_models()
+                deadline = time.monotonic() + 0.3
+                while time.monotonic() < deadline:
+                    self.app.update()
+                    time.sleep(0.01)
+            self.assertEqual(tuple(self.app.tr_model_box["values"]), tuple(sorted(names)))
+            self.assertEqual(self.app.tr_model_var.get(), "local:latest" if names else "")
+
+    def test_live_reader_updates_batches_and_keeps_reading_position(self):
+        self.app.reading_chapters.clear()
+        self.app._update_reading(("简体中文", 1, "第一章", ["原文"] * 100,
+                                  [f"译文 {i}" for i in range(100)]))
+        self.app._open_reader()
+        reader = self.app.reader_window
+        self.addCleanup(reader.destroy)
+        reader.update()
+        reader.text.yview("30.0")
+        reader.update()
+        before = reader.text.index("@0,0")
+        self.app.log_queue.put(("reading", ("简体中文", 1, "第一章", ["原文"] * 101,
+                                            [f"译文 {i}" for i in range(101)])))
+        self.app._poll_queue()
+        reader.update()
+        self.assertEqual(reader.text.index("@0,0"), before)
+        self.assertIn("译文 100", reader.text.get("1.0", "end"))
+        reader.bilingual.set(True)
+        reader.render()
+        self.assertIn("原文", reader.text.get("1.0", "end"))
 
 
 if __name__ == "__main__":

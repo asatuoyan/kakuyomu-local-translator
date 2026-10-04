@@ -46,13 +46,14 @@ class TaskStateMixin:
 
     def _poll_queue(self):
         try:
-            while True:
+            for _ in range(200):
                 msg_type, payload = self.log_queue.get_nowait()
                 if msg_type == "log":
-                    self.log_text.insert(tk.END, payload)
-                    self.log_text.see(tk.END)
+                    self._append_log(payload)
                 elif msg_type == "progress":
                     self.progress_var.set(payload)
+                elif msg_type == "reading":
+                    self._update_reading(payload)
                 elif msg_type == "status":
                     self.status_var.set(payload)
                 elif msg_type == "error":
@@ -61,12 +62,15 @@ class TaskStateMixin:
                     if self.audit_state_var.get() == "检查中":
                         self.audit_state_var.set("检查失败")
                         self.audit_empty_var.set("检查失败，请查看运行日志后重试")
-                    if not self.log_panel.winfo_manager():
+                    if self.log_window.state() == "withdrawn":
                         self._toggle_log()
                     self.log_toggle.configure(text="运行日志 ·")
-                    self.log_text.insert(tk.END, f"[錯誤] {payload}\n")
-                    self.log_text.see(tk.END)
+                    self._append_log(f"[错误] {payload}\n")
                     self._dialogs.showerror("執行錯誤", payload)
+                elif msg_type == "login_closed":
+                    self._set_busy(False)
+                    self.status_var.set("登录浏览器已关闭；如已完成登录，可重新读取目录。")
+                    self._append_log("登录浏览器已关闭。已完成的登录会保留；请点击读取目录验证。\n")
                 elif msg_type == "toc_loaded":
                     self._set_busy(False)
                     work: WorkInfo = payload
@@ -79,14 +83,14 @@ class TaskStateMixin:
                     self.dl_end_var.set(str(len(work.episodes)))
                     for i, ep in enumerate(work.episodes, 1):
                         self.dl_toc_listbox.insert(tk.END, f"{i:4d}. {ep['title']}")
-                    self.log_text.insert(tk.END, f"成功讀取作品《{work.title}》目錄，共 {len(work.episodes)} 章。\n")
+                    self._append_log(f"成功读取作品《{work.title}》目录，共 {len(work.episodes)} 章。\n")
                 elif msg_type == "download_complete":
                     self._set_busy(False)
-                    self.log_text.insert(tk.END, f"日文 EPUB 下載完成：{payload}\n")
+                    self._append_log(f"日文 EPUB 下载完成：{payload}\n")
                     self._dialogs.showinfo("下載完成", f"日文原文 EPUB 已成功生成：\n{payload}")
                 elif msg_type == "translate_complete":
                     self._set_busy(False)
-                    self.log_text.insert(tk.END, f"EPUB 翻譯完成：\n{payload}\n")
+                    self._append_log(f"EPUB 翻译完成：\n{payload}\n")
                     self._dialogs.showinfo("翻譯完成", f"各語言 EPUB 已成功生成：\n{payload}")
                 elif msg_type == "translate_stopped":
                     self._set_busy(False)
@@ -118,7 +122,7 @@ class TaskStateMixin:
                     self._on_audit_project_change()
                     self.audit_state_var.set("译文已更新 · 请重新检查")
                     self.audit_empty_var.set("译文已更新，请重新检查以刷新问题列表")
-                    self.log_text.insert(tk.END, f"局部重譯完成！EPUB 已更新：{payload}\n")
+                    self._append_log(f"局部重译完成！EPUB 已更新：{payload}\n")
                     self._dialogs.showinfo("局部重譯完成", f"受影響章節已局部重譯完成，EPUB 電子書已更新：\n{payload}")
         except queue.Empty:
             pass

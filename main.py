@@ -15,6 +15,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from adaptive_batches import AdaptiveBatcher
+from murasaki_profile import (uses_murasaki_profile, translation_payload,
+                              translation_only, ThinkingBudgetExceeded)
+from hy_mt_profile import (uses_hy_mt_30b_profile, reference_context_limit,
+                           translation_payload as hy_mt_translation_payload)
 from app_config import (APP_DIR, CONFIG_PATH, DEFAULT_MODEL, TRANSLATION_MODELS,
                         load_config as read_app_config, update_config)
 from project_storage import (TranslationCache, atomic_json, load_json,
@@ -279,16 +284,41 @@ def select_model(cfg: dict[str, Any], allow_cancel: bool = False) -> bool:
     choices = list(TRANSLATION_MODELS.items())
     for index, (label, _) in enumerate(choices, 1):
         print(f"  {index}. {label}")
+    local_choice = str(len(choices) + 1)
+    custom_choice = str(len(choices) + 2)
+    print(f"  {local_choice}. 选择 Ollama 已部署的本地模型")
+    print(f"  {custom_choice}. 手动输入 Ollama 模型名称")
     if allow_cancel:
         print("  Enter. 保持当前模型")
     choice = input("请选择：").strip()
     if allow_cancel and not choice:
         return False
-    if choice not in {str(i) for i in range(1, len(choices) + 1)}:
+    if choice == local_choice:
+        try:
+            names = sorted(name for name in installed_models(cfg) if name)
+        except RuntimeError as exc:
+            print(str(exc))
+            return False
+        if not names:
+            print("当前 Ollama 服务没有已部署的模型。")
+            return False
+        for index, name in enumerate(names, 1):
+            print(f"  {index}. {name}")
+        selection = input("请选择本地模型（Enter 取消）：").strip()
+        if selection not in {str(i) for i in range(1, len(names) + 1)}:
+            return False
+        model = names[int(selection) - 1]
+    elif choice == custom_choice:
+        model = input("请输入完整模型名称（含标签，Enter 取消）：").strip()
+        if not model:
+            return False
+    elif choice in {str(i) for i in range(1, len(choices) + 1)}:
+        model = choices[int(choice) - 1][1]
+    else:
         print("无效选择。")
         return False
     candidate = dict(cfg)
-    candidate["model"] = choices[int(choice) - 1][1]
+    candidate["model"] = model
     if not ensure_model(candidate):
         return False
     cfg["model"] = candidate["model"]
@@ -338,6 +368,8 @@ def _read_ollama_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
     try:
         response.raise_for_status()
         content_parts: list[str] = []
+        generated = 0
+        thinking = 0
         for raw in response.iter_lines():
             check_translation_cancelled(cfg)
             if not raw:
@@ -356,9 +388,21 @@ def _read_ollama_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
             if not isinstance(message, dict) or not isinstance(message.get("content", ""), str):
                 raise RuntimeError("Ollama 返回了无效的消息内容。")
             content_parts.append(message.get("content", ""))
+            generated += len(message.get("content", ""))
+            thinking += len(message.get("thinking", "")) if isinstance(message.get("thinking", ""), str) else 0
+            if cfg.get("_thinking_char_limit") and thinking > cfg["_thinking_char_limit"]:
+                raise ThinkingBudgetExceeded("Murasaki 思考超出预算，切换为直接翻译。")
+            if cfg.get("_translation_output_chars") and generated > cfg["_translation_output_chars"]:
+                raise RuntimeError("Ollama 输出达到长度限制：生成内容远超原文长度，已停止本次请求。")
+            if cfg.get("_stream_activity"):
+                cfg["_stream_activity"](generated, thinking)
             if event.get("done") is True:
                 if event.get("done_reason") in {"length", "max_tokens"}:
                     raise RuntimeError("Ollama 输出达到长度限制，译文未完成。")
+                if cfg.get("_translation_metrics"):
+                    cfg["_translation_metrics"]({key: event.get(key, 0) for key in (
+                        "load_duration", "prompt_eval_count", "prompt_eval_duration",
+                        "eval_count", "eval_duration", "total_duration")})
                 return "".join(content_parts)
         raise RuntimeError("Ollama 响应提前结束，未收到完成标记。")
     finally:
@@ -380,6 +424,10 @@ def ollama_chat_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
     abandoned = threading.Event()
     request_cfg = dict(cfg)
     request_cfg["_translation_cancelled"] = abandoned.is_set
+    activity = [0, 0]
+    request_cfg["_stream_activity"] = lambda generated, thinking: activity.__setitem__(slice(None), [generated, thinking])
+    started = time.monotonic()
+    next_update = started
 
     def receive():
         try:
@@ -391,6 +439,13 @@ def ollama_chat_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
     try:
         while True:
             check_translation_cancelled(cfg)
+            now = time.monotonic()
+            if cfg.get("_translation_activity") and now >= next_update:
+                elapsed = int(now - started)
+                details = (f"已生成 {activity[0]} 字" if activity[0] else
+                           (f"模型思考中 · {activity[1]} 字" if activity[1] else "等待模型响应 / 加载"))
+                cfg["_translation_activity"](f"{cfg.get('_activity_label', '')} · {details} · {elapsed} 秒")
+                next_update = now + 1
             try:
                 success, value = results.get(timeout=0.1)
             except queue.Empty:
@@ -405,7 +460,7 @@ def ollama_chat_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
 
 def translate_chunk(
     paragraphs: list[str], cfg: dict[str, Any], previous_context: str = "",
-    *, _repeat_retry: bool = False,
+    *, _repeat_retry: bool = False, _context_retry: bool = False,
 ) -> list[str]:
     check_translation_cancelled(cfg)
     if not paragraphs:
@@ -415,23 +470,60 @@ def translate_chunk(
         references.append(f"参考下面的翻译：\n{glossary_text(cfg)}")
     context_chars = max(0, int(cfg.get("context_chars", 1200)))
     if previous_context and context_chars:
-        references.append(f"前文背景（仅供参考，不要翻译）：\n{previous_context[-context_chars:]}")
+        references.append(f"<previous_translation>\n{previous_context[-context_chars:]}\n</previous_translation>\n"
+                          "以上是已完成译文，仅供理解人物关系。禁止复制、续写或再次输出以上内容。")
     instruction = f"将以下文本翻译为{language_name(cfg['target_language'])}，只输出翻译结果，不要额外解释。"
     if len(paragraphs) > 1:
         instruction += "保持段落数量和顺序，段落之间保留一个空行。"
-    user = "\n\n".join([*references, instruction, "\n\n".join(paragraphs)])
+    user = "\n\n".join([*references, instruction,
+                           "只翻译 <source_text> 内的原文，输出不包含标签。",
+                           "<source_text>\n" + "\n\n".join(paragraphs) + "\n</source_text>"])
+    source_chars = sum(map(len, paragraphs))
+    request_cfg = dict(cfg)
+    # Allow expansion across languages while bounding runaway generations for
+    # short titles as well as body text. Only translation requests use this guard.
+    request_cfg["_translation_output_chars"] = max(512, source_chars * 6)
     payload = {
         "model": cfg["model"],
+        "think": False,
         "messages": [{"role": "user", "content": user}],
-        "options": {"temperature": max(0.5, float(cfg.get("temperature", 0.2))) if _repeat_retry else cfg.get("temperature", 0.2)},
+        "options": {
+            "temperature": max(0.5, float(cfg.get("temperature", 0.2))) if _repeat_retry else cfg.get("temperature", 0.2),
+            "num_predict": max(256, source_chars * 4 + 128),
+        },
     }
+    murasaki = uses_murasaki_profile(cfg)
+    if murasaki:
+        payload = translation_payload(paragraphs, cfg, retry=_repeat_retry)
+        if payload["think"]:
+            request_cfg["_thinking_char_limit"] = min(4096, max(1024, source_chars * 2))
+        # Some Ollama imports put inline reasoning in content rather than thinking.
+        request_cfg["_translation_output_chars"] = max(16384, source_chars * 6)
+    elif uses_hy_mt_30b_profile(cfg):
+        payload = hy_mt_translation_payload(
+            paragraphs, cfg, previous_context, retry=_repeat_retry)
     try:
-        content = ollama_chat_content(payload, cfg)
+        content = ollama_chat_content(payload, request_cfg)
+        if murasaki:
+            content = translation_only(content)
+        if len(content) > max(512, source_chars * 6):
+            raise RuntimeError("Ollama 输出达到长度限制：生成内容远超原文长度。")
+    except ThinkingBudgetExceeded:
+        if cfg.get("_batch_degraded"):
+            cfg["_batch_degraded"]()
+        print("  Murasaki 思考超出预算，停止本次请求并直接翻译一次……", flush=True)
+        direct_cfg = dict(cfg)
+        direct_cfg["murasaki_thinking_mode"] = "off"
+        return translate_chunk(paragraphs, direct_cfg, previous_context,
+                               _repeat_retry=_repeat_retry, _context_retry=_context_retry)
     except RuntimeError as exc:
-        if "token repeat limit reached" not in str(exc).lower():
+        if not any(marker in str(exc).lower() for marker in
+                   ("token repeat limit reached", "输出达到长度限制")):
             raise
         if len(paragraphs) > 1:
-            print(f"  模型遇到重複 token 限制，自動拆分 {len(paragraphs)} 段重試……", flush=True)
+            if cfg.get("_batch_degraded"):
+                cfg["_batch_degraded"]()
+            print(f"  模型输出受限，自動拆分 {len(paragraphs)} 段重試……", flush=True)
             midpoint = len(paragraphs) // 2
             first = translate_chunk(paragraphs[:midpoint], cfg, previous_context)
             continued_context = "\n".join(part for part in [previous_context, *first] if part)
@@ -447,6 +539,8 @@ def translate_chunk(
     if len(translations) != len(paragraphs):
         returned_count = len(translations)
         if len(paragraphs) > 1:
+            if cfg.get("_batch_degraded"):
+                cfg["_batch_degraded"]()
             midpoint = len(paragraphs) // 2
             print(
                 f"  模型回傳 {returned_count}/{len(paragraphs)} 段，"
@@ -462,7 +556,27 @@ def translate_chunk(
         raise RuntimeError(
             f"模型回傳 {returned_count} 段，但預期 1 段。"
         )
-    return [normalize_output(normalize_text(str(x)), cfg["target_language"]) for x in translations]
+    results = [normalize_output(normalize_text(str(x)), cfg["target_language"]) for x in translations]
+    context_lines = [normalize_output(line.strip(), cfg["target_language"])
+                     for line in previous_context.splitlines() if len(line.strip()) >= 10]
+    source_text = "\n".join(paragraphs)
+    copied_context = any(line in target and line not in source_text
+                         for line in context_lines for target in results)
+    repeated = any(results[i] == results[j] and paragraphs[i] != paragraphs[j]
+                   and len(results[i]) >= 10
+                   for i in range(len(results)) for j in range(i))
+    for target in results:
+        lines = [line.strip() for line in target.splitlines() if len(line.strip()) >= 10]
+        repeated = repeated or len(lines) != len(set(lines))
+    if copied_context or repeated:
+        if cfg.get("_batch_degraded"):
+            cfg["_batch_degraded"]()
+        if _context_retry:
+            raise RuntimeError("译文重复前文或不同原文返回相同译文，未保存该批次。")
+        print("  译文疑似重复前文，移除译文参考并逐段重试……", flush=True)
+        return [translate_chunk([paragraph], cfg, "", _context_retry=True)[0]
+                for paragraph in paragraphs]
+    return results
 
 
 def make_batches(
@@ -515,9 +629,15 @@ def run_translation_batch(operation, cfg: dict[str, Any], label: str):
                 raise
             if attempt == retries:
                 raise
+            if cfg.get("_batch_degraded"):
+                cfg["_batch_degraded"]()
             wait = min(delay * (2 ** min(attempt, 10)), 60.0)
             print(f"  [{label}自動重試] {exc}；{wait:g} 秒後重試 "
                   f"({attempt + 1}/{retries})，保留已完成進度。", flush=True)
+            if cfg.get("_translation_activity"):
+                cfg["_translation_activity"](
+                    f"{cfg.get('_activity_label', label)} · {wait:g} 秒后重试 "
+                    f"{attempt + 1}/{retries} · {exc}")
             # Short sleeps keep GUI cancellation responsive during backoff.
             remaining = wait
             while remaining > 0:
@@ -541,12 +661,16 @@ def _translate_episode(episode: Episode, cfg: dict[str, Any], cache: Translation
     chapter_hash = compute_content_hash(episode.paragraphs)
     for i, paragraph in enumerate(episode.paragraphs):
         key_source = json.dumps(
-            [2, cfg["model"], cfg["target_language"], cfg.get("glossary", {}),
+            [3, cfg["model"], cfg["target_language"], cfg.get("glossary", {}),
              cfg.get("temperature", 0.2), cfg.get("context_chars", 1200),
              episode.url, chapter_hash, i, paragraph],
             ensure_ascii=False,
             sort_keys=True,
         )
+        if uses_murasaki_profile(cfg):
+            key_source += "|murasaki-v0.2-profile-2|" + cfg.get("murasaki_thinking_mode", "auto")
+        elif uses_hy_mt_30b_profile(cfg):
+            key_source += f"|hy-mt2-30b-profile-2|{reference_context_limit(cfg)}|{cfg.get('hy_mt_num_ctx', 4096)}"
         key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
         keys.append(key)
         cached = cache.get(key)
@@ -557,20 +681,45 @@ def _translate_episode(episode: Episode, cfg: dict[str, Any], cache: Translation
             missing.append(paragraph)
             positions.append(i)
 
+    progress = cfg.get("_episode_progress")
+    completed = len(translated) - len(missing)
+    if progress:
+        progress(completed, len(translated))
+    live = cfg.get("_episode_live")
+    if live:
+        live(list(translated))
     if missing:
-        batches = make_batches(
-            missing,
-            int(cfg.get("translation_chunk_chars", 2200)),
-            int(cfg.get("translation_chunk_paragraphs", 40)),
-        )
+        adaptive = cfg.get("adaptive_translation_batches", True)
+        controller = cfg.get("_adaptive_batcher") or AdaptiveBatcher(cfg)
+        local = dict(cfg)
+        if adaptive:
+            local["_batch_degraded"] = controller.mark_degraded
         cursor = 0
-        print(f"需要翻譯 {len(missing)} 段，共 {len(batches)} 批。")
-        for batch_no, batch in enumerate(batches, 1):
-            print(f"  翻譯第 {batch_no}/{len(batches)} 批……", flush=True)
+        batch_no = 0
+        print(f"需要翻译 {len(missing)} 段，{'自适应' if adaptive else '固定'}分批。")
+        if adaptive:
+            print(f"  {controller.preset.name} · 当前目标 {controller.chars} 字 / "
+                  f"{controller.items} 段 · 上限 {controller.ceiling} 字 · "
+                  f"运行上下文 {controller.context_length} token（还会按参考文本预算缩小）")
+        while cursor < len(missing):
+            batch_no += 1
             context = "\n".join(x for x in translated[: positions[cursor]] if x)
+            if adaptive:
+                context_limit = (reference_context_limit(cfg) if uses_hy_mt_30b_profile(cfg)
+                                 else int(cfg.get("context_chars", 1200)))
+                reference_chars = min(len(context), context_limit) + len(glossary_text(cfg))
+                batch = controller.take(missing[cursor:], reference_chars)
+            else:
+                batch = make_batches(missing[cursor:], int(cfg.get("translation_chunk_chars", 2200)),
+                                     int(cfg.get("translation_chunk_paragraphs", 40)))[0]
+            local["_activity_label"] = f"批次 {batch_no} · {len(batch)} 段 · 原文 {sum(map(len, batch))} 字"
+            print(f"  {local['_activity_label']}（{'自适应' if adaptive else '固定'}）……", flush=True)
+            started = time.monotonic()
             result = run_translation_batch(
-                lambda: translate_chunk(batch, cfg, context), cfg, "翻譯"
+                lambda: translate_chunk(batch, local, context), local, "翻譯"
             )
+            if adaptive:
+                controller.observe(time.monotonic() - started)
             check_translation_cancelled(cfg)
             updates = []
             for source, target in zip(batch, result):
@@ -579,11 +728,18 @@ def _translate_episode(episode: Episode, cfg: dict[str, Any], cache: Translation
                 updates.append((keys[pos], target))
                 cursor += 1
             cache.save(updates)
+            if progress:
+                progress(completed + cursor, len(translated))
+            if live:
+                live(list(translated))
     else:
         print("本章已命中本機翻譯快取。")
     if cfg.get("check_glossary", True):
         translated = report_and_check_compliance(episode, translated, cfg, label="初譯")
-    return [normalize_output(value, cfg["target_language"]) for value in translated]
+    result = [normalize_output(value, cfg["target_language"]) for value in translated]
+    if live:
+        live(result)
+    return result
 
 
 def add_or_update_project(
@@ -815,7 +971,9 @@ def browser_mode(cfg: dict[str, Any], fixed_work_dir: Path | None = None) -> Non
         context.close()
 
 
-def _launch_context(playwright: Any, cfg: dict[str, Any]) -> BrowserContext:
+def _launch_context(
+    playwright: Any, cfg: dict[str, Any], *, prompt_for_cookies: bool = True,
+) -> BrowserContext:
     browser = cfg.get("browser_engine", "msedge")
     profile_base = Path(cfg["browser_profile_dir"])
     profile = profile_base if browser == "chromium" else profile_base.with_name(
@@ -845,7 +1003,7 @@ def _launch_context(playwright: Any, cfg: dict[str, Any]) -> BrowserContext:
             f"無法啟動 {name}。請確認瀏覽器已安裝，或重新執行並選擇其他瀏覽器。\n{exc}"
         ) from exc
     cookie_path = APP_DIR / "cookies.json"
-    if cookie_path.exists():
+    if prompt_for_cookies and cookie_path.exists():
         answer = input("发现 cookies.json，是否导入其中的 Cookie？[y/N] ").strip().lower()
         if answer == "y":
             print(f"已导入 {import_cookie_json(context, cookie_path)} 条 Cookie。")
@@ -994,8 +1152,9 @@ class TranslationBook:
     """Persist completed chapters and build small EPUBs before merging the full book."""
 
     def __init__(self, source: Path, work_dir: Path, metadata: dict[str, Any], language: str,
-                 source_chapters: list[SourceChapter] | None = None):
+                 source_chapters: list[SourceChapter] | None = None, bilingual: bool = False):
         self.work_dir = work_dir
+        self.bilingual = bilingual
         self.language = language
         self.path = work_dir / "translation-project.json"
         source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -1021,6 +1180,8 @@ class TranslationBook:
             if self.metadata.get(key):
                 self.metadata[key] = normalize_output(self.metadata[key], language)
         self.output = work_dir / f"{safe_name(self.metadata['title'])}_{language_suffix(language)}.epub"
+        if bilingual:
+            self.output = self.output.with_name(self.output.stem + "_双语对照.epub")
 
     def completed(self, index: int, chapter: SourceChapter) -> bool:
         records = self.state["chapters"]
@@ -1049,10 +1210,29 @@ class TranslationBook:
         save_translation_state(self.path, self.state, [index - 1])
 
     def _chapters(self, start: int, end: int) -> list[SourceChapter]:
-        return [SourceChapter(url=record["url"], title=record["title"],
+        chapters = [SourceChapter(url=record["url"], title=record["title"],
                               paragraphs=record["paragraphs"], blocks=record["blocks"],
                               images=record["images"])
                 for record in self.state["chapters"][start - 1:end]]
+        if self.bilingual:
+            for chapter, record in zip(chapters, self.state["chapters"][start - 1:end]):
+                originals = record.get("source_paragraphs")
+                if originals is None or len(originals) != len(chapter.paragraphs):
+                    raise ValueError("双语对照输出缺少匹配的原文，请重新读取原始 EPUB。")
+                blocks = chapter.blocks or [{"type": "text", "text": p}
+                                            for p in chapter.paragraphs]
+                paired = []
+                position = 0
+                for block in blocks:
+                    if block.get("type") == "text":
+                        paired.append({"type": "text", "text": originals[position],
+                                       "role": "original"})
+                        paired.append({**block, "role": "translation"})
+                        position += 1
+                    else:
+                        paired.append(dict(block))
+                chapter.blocks = paired
+        return chapters
 
     def _build(self, start: int, end: int, output: Path) -> Path:
         temporary = output.with_suffix(".tmp.epub")
@@ -1263,6 +1443,7 @@ def translation_work_dir(source: Path, cfg: dict[str, Any], language: str) -> Pa
 def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
                             progress=None) -> Path:
     """One resumable language job, shared by the GUI and command line."""
+    check_translation_cancelled(cfg)
     language = language_name(language)
     normalize_output("", language)  # Check the converter before doing model work.
     work_dir = translation_work_dir(source, cfg, language)
@@ -1270,6 +1451,37 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     metadata, chapters = extract_epub_chapters(source, work_dir / "assets")
     chapter_cfg = dict(cfg)
     chapter_cfg["target_language"] = language
+    if uses_murasaki_profile(chapter_cfg):
+        chapter_cfg["translation_chunk_chars"] = min(
+            1536, int(chapter_cfg.get("translation_chunk_chars", 2200)))
+    if cfg.get("adaptive_translation_batches", True):
+        context_length = 4096
+        try:
+            if not cfg.get("ollama_url"):
+                raise ValueError("没有配置 Ollama 地址")
+            response = requests.get(cfg["ollama_url"].rstrip("/") + "/api/ps", timeout=5)
+            response.raise_for_status()
+            model = next((item for item in response.json().get("models", [])
+                          if item.get("name") == cfg["model"] or item.get("model") == cfg["model"]), {})
+            if model.get("context_length"):
+                context_length = int(model["context_length"])
+            else:
+                # An unloaded model is absent from /api/ps. Read its configured
+                # window instead of treating native GGUF capacity as runtime RAM.
+                response = requests.post(
+                    cfg["ollama_url"].rstrip("/") + "/api/show",
+                    json={"model": cfg["model"]}, timeout=5)
+                response.raise_for_status()
+                parameters = response.json().get("parameters", "")
+                match = re.search(r"(?m)^num_ctx\s+(\d+)\s*$", parameters)
+                context_length = int(match.group(1)) if match else 4096
+        except (requests.RequestException, ValueError, TypeError):
+            pass
+        if uses_hy_mt_30b_profile(chapter_cfg):
+            # The profile explicitly requests this window, so planning must use
+            # the same value even when /api/ps still reports the old allocation.
+            context_length = int(chapter_cfg.get("hy_mt_num_ctx", 4096))
+        chapter_cfg["_adaptive_batcher"] = AdaptiveBatcher(chapter_cfg, context_length)
     chapter_cfg["glossary"] = output_glossary(cfg, language)
     entries = get_effective_glossary(chapter_cfg, work_dir)
     chapter_cfg["glossary"] = entries_to_dict(entries)
@@ -1284,37 +1496,69 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
         if cancelled():
             raise TranslationCancelled()
 
-    def translate(ep):
+    completed_units = 0
+    total_units = (1 + bool(metadata.get("description"))
+                   + sum(1 + len(ch.paragraphs) for ch in chapters))
+
+    def report(message):
+        if progress:
+            progress(completed_units / total_units * 99, f"{language} · {message}")
+
+    def translate(ep, label, reading=None):
+        nonlocal completed_units
         check_cancelled()
-        drafts = translate_episode(ep, chapter_cfg, work_dir)
+        def episode_progress(done, total):
+            if progress:
+                percent = (completed_units + done) / total_units * 99
+                progress(percent, f"{language} · {label} · 段落 {done}/{total}")
+
+        local_cfg = dict(chapter_cfg)
+        local_cfg["_episode_progress"] = episode_progress
+        if cfg.get("_translation_activity"):
+            local_cfg["_translation_activity"] = lambda message: cfg["_translation_activity"](
+                f"{language} · {label} · {message}")
+        local_cfg.pop("_episode_live", None)
+        if reading and cfg.get("_reading_update"):
+            local_cfg["_episode_live"] = lambda texts: cfg["_reading_update"](
+                language, reading, ep.episode_title, list(ep.paragraphs),
+                [normalize_output(t, language) for t in texts])
+        drafts = translate_episode(ep, local_cfg, work_dir)
+        completed_units += len(ep.paragraphs)
         return drafts
 
     values = [metadata.get("title", source.stem)]
     if metadata.get("description"):
         values.append(metadata["description"])
     final = translate(Episode(url="epub://metadata", work_title="", episode_title="作品資訊",
-                              paragraphs=values, blocks=[{"type": "text", "text": v} for v in values]))
+                              paragraphs=values, blocks=[{"type": "text", "text": v} for v in values]), "作品信息")
     metadata["title"] = final[0]
     if len(final) > 1:
         metadata["description"] = final[1]
-    book = TranslationBook(source, work_dir, metadata, language, chapters)
+    book = TranslationBook(source, work_dir, metadata, language, chapters,
+                           bilingual=cfg.get("bilingual_output", False))
     for index, chapter in enumerate(chapters, 1):
         check_cancelled()
-        if progress:
-            progress((index - 1) / len(chapters) * 100, f"{language} · {index}/{len(chapters)} · {chapter.title}")
+        label = f"章节 {index}/{len(chapters)} · {chapter.title}"
+        report(label)
         print(f"[{language} {index}/{len(chapters)}] {chapter.title}", flush=True)
         if not book.completed(index, chapter):
             title_ep = Episode(url=chapter.url + "#title", work_title="", episode_title=chapter.title,
                                paragraphs=[chapter.title], blocks=[{"type": "text", "text": chapter.title}])
-            title = translate(title_ep)[0]
+            title = translate(title_ep, f"{label} · 标题")[0]
             episode = _episode_from_source(chapter)
             episode.episode_title = title
-            translated = _translated_chapter(chapter, translate(episode))
+            translated = _translated_chapter(chapter, translate(episode, label, index))
             translated.title = title
             book.save(index, chapter, translated)
-        for output in book.checkpoint(index, len(chapters)):
-            print(f"已儲存 EPUB：{output}", flush=True)
+        else:
+            completed_units += 1 + len(chapter.paragraphs)
+            if cfg.get("_reading_update"):
+                record = book.state["chapters"][index - 1]
+                cfg["_reading_update"](language, index, record["title"], chapter.paragraphs,
+                                       [normalize_output(t, language) for t in record["paragraphs"]])
+        report(f"{label} · 已保存")
     check_cancelled()
+    report("正在生成 EPUB")
     output = book.finish(len(chapters))
     if progress:
         progress(100.0, f"{language} · 已完成")

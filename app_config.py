@@ -19,8 +19,8 @@ TRANSLATION_MODELS = {
 }
 DEFAULT_MODEL = TRANSLATION_MODELS["Hy-MT2 7B Q4_K_M"]
 
-_POSITIVE_INTS = ("translation_chunk_chars", "translation_chunk_paragraphs")
-_NONNEGATIVE_INTS = ("translation_max_retries", "context_chars")
+_POSITIVE_INTS = ("translation_chunk_chars", "translation_chunk_paragraphs", "hy_mt_num_ctx")
+_NONNEGATIVE_INTS = ("translation_max_retries", "context_chars", "hy_mt_context_chars")
 _POSITIVE_NUMBERS = ("request_timeout_seconds",)
 _NONNEGATIVE_NUMBERS = ("translation_retry_delay_seconds", "request_delay_seconds", "temperature")
 
@@ -73,6 +73,11 @@ def validate_config(raw: Mapping[str, Any], app_dir: Path = APP_DIR) -> dict[str
             raise ValueError(f"config.json 中的 {key} 必须是对象。")
     if not isinstance(config["headless"], bool):
         raise ValueError("config.json 中的 headless 必须是布尔值。")
+    if not isinstance(config["hy_mt_prefer_whole_chapter"], bool):
+        raise ValueError("config.json 中的 hy_mt_prefer_whole_chapter 必须是布尔值。")
+    if not isinstance(config["glossary_model"], str):
+        raise ValueError("config.json 中的 glossary_model 必须是字符串。")
+    config["glossary_model"] = config["glossary_model"].strip()
     return config
 
 

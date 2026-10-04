@@ -17,6 +17,7 @@ def check_translation_quality(source: list[str], target: list[str]) -> list[Qual
     if len(source) != len(target):
         raise ValueError("原文与译文段落数量不一致。")
     warnings = []
+    previous = {}
     for index, (original, translated) in enumerate(zip(source, target), 1):
         a, b = original.strip(), translated.strip()
         if not a:
@@ -30,6 +31,14 @@ def check_translation_quality(source: list[str], target: list[str]) -> list[Qual
             reason = "译文可能过短"
         elif len(a) >= 20 and len(b) > len(a) * 5:
             reason = "译文可能过长"
+        elif any(text in b and original_source != a and text not in a
+                 for text, original_source in previous.items()):
+            reason = "译文疑似重复前文"
+        lines = [line.strip() for line in b.splitlines() if len(line.strip()) >= 10]
+        if not reason and len(lines) != len(set(lines)):
+            reason = "译文内部重复"
         if reason:
             warnings.append(QualityWarning(index, "", "请人工核对", reason, a, b))
+        if len(b) >= 10:
+            previous[b] = a
     return warnings

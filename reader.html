@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>实时阅读</title>
+<style>
+:root{color-scheme:light;--bg:#f7f3e9;--fg:#302c26;--panel:#fffaf0}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif}body.dark{color-scheme:dark;--bg:#1d2025;--fg:#e5e1d9;--panel:#292d34}header{position:sticky;top:0;background:var(--panel);padding:12px;box-shadow:0 1px 5px #8884;z-index:1}.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;max-width:900px;margin:auto}select,button{font:inherit;padding:6px;max-width:100%}select{flex:1;min-width:180px}label{white-space:nowrap}#status{font-size:13px;max-width:900px;margin:8px auto 0}main{max-width:800px;margin:auto;padding:24px 20px 80px;font-size:20px;line-height:1.9}h1{font-size:1.3em}p{white-space:pre-wrap;overflow-wrap:anywhere}.original{opacity:.7;margin-bottom:4px}.translation{margin-top:4px}body.bilingual .translation{border-left:2px solid #8888;padding-left:12px}
+</style>
+<header><div class="controls"><select id="chapters" aria-label="章节"><option value="">等待译文</option></select><label><input id="bilingual" type="checkbox">原文对照</label><button id="smaller" aria-label="缩小字号">A−</button><button id="larger" aria-label="增大字号">A+</button><label><input id="night" type="checkbox">夜间</label></div><div id="status" role="status">正在连接翻译程序……</div></header>
+<main id="content"><h1>实时阅读</h1><p>开始翻译后，每完成一批段落就会在这里显示。</p></main>
+<script>
+const $=id=>document.getElementById(id),base=location.pathname;
+let book='',current='',revision=-1,record=null,size=20,restoring=false;
+function read(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback}catch{return fallback}}
+function save(key,value){try{localStorage.setItem(key,JSON.stringify(value))}catch{}}
+let prefs=read('reader-preferences',{});size=prefs.size||20;$('night').checked=!!prefs.night;$('bilingual').checked=!!prefs.bilingual;
+function style(){document.body.classList.toggle('dark',$('night').checked);document.body.classList.toggle('bilingual',$('bilingual').checked);$('content').style.fontSize=size+'px';save('reader-preferences',{size,night:$('night').checked,bilingual:$('bilingual').checked})}style();
+function positionKey(){return 'reader-position:'+book+':'+current}
+function render(restore=false){if(!record)return;const y=restore?read(positionKey(),0):scrollY;const main=$('content');main.replaceChildren();const h=document.createElement('h1');h.textContent=record.title;main.append(h);let count=0;record.translations.forEach((text,i)=>{if(!text)return;count++;if($('bilingual').checked){const p=document.createElement('p');p.className='original';p.textContent=record.originals[i];main.append(p)}const p=document.createElement('p');p.className='translation';p.textContent=text;main.append(p)});if(!count){const p=document.createElement('p');p.textContent='等待本章第一批译文……';main.append(p)}restoring=true;requestAnimationFrame(()=>{scrollTo(0,y);restoring=false})}
+$('bilingual').onchange=()=>{style();render()};$('night').onchange=style;$('smaller').onclick=()=>{size=Math.max(14,size-2);style()};$('larger').onclick=()=>{size=Math.min(36,size+2);style()};
+addEventListener('scroll',()=>{if(current&&!restoring)save(positionKey(),scrollY)},{passive:true});
+$('chapters').onchange=()=>{current=$('chapters').value;revision=-1;record=null;save('reader-chapter:'+book,current);poll()};
+let pending=false;
+async function poll(){if(pending)return;pending=true;try{const response=await fetch(base+'catalog');if(!response.ok)throw Error();const catalog=await response.json();if(book!==catalog.book){book=catalog.book;current=read('reader-chapter:'+book,'');revision=-1;record=null}const ids=catalog.chapters.map(c=>c.id);if(JSON.stringify(ids)!==JSON.stringify([...$('chapters').options].map(o=>o.value))){$('chapters').replaceChildren();catalog.chapters.forEach(c=>{const option=document.createElement('option');option.value=c.id;option.textContent=c.title;$('chapters').append(option)})}if(!ids.includes(current)){current=ids[0]||'';revision=-1;record=null}$('chapters').value=current;const chapter=catalog.chapters.find(c=>c.id===current);if(chapter&&chapter.revision!==revision){const r=await fetch(base+'chapter?id='+encodeURIComponent(current));if(!r.ok)throw Error();const next=await r.json();if(next){const first=revision===-1;record=next;revision=next.revision;render(first)}}$('status').textContent=chapter?'每两秒检查新译文 · 更新时保留阅读位置':'等待翻译开始……'}catch{$('status').textContent='连接已断开，正在重试；请保持电脑程序运行。'}finally{pending=false}}
+poll();setInterval(poll,2000);
+</script></html>

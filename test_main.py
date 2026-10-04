@@ -22,6 +22,30 @@ class FakeResponse:
 
 
 class OllamaChatContentTests(unittest.TestCase):
+    @patch("main.requests.post")
+    def test_runaway_translation_stream_stops_and_closes_response(self, post):
+        import json
+        response = FakeResponse([
+            json.dumps({"message": {"content": "x" * 513}}),
+            '{"message":{"content":"should not be read"},"done":true}',
+        ])
+        post.return_value = response
+        with self.assertRaisesRegex(RuntimeError, "远超原文长度"):
+            main._read_ollama_content({}, {
+                "ollama_url": "http://localhost", "_translation_output_chars": 512})
+        self.assertTrue(response.closed)
+
+    @patch("main.requests.post")
+    def test_stream_activity_reports_generated_and_thinking_characters(self, post):
+        from unittest.mock import Mock
+        activity = Mock()
+        cfg = {"ollama_url": "http://localhost:11434", "_stream_activity": activity}
+        post.return_value = FakeResponse([
+            b'{"message":{"thinking":"abc"}}',
+            b'{"message":{"content":"result"},"done":true}'])
+        self.assertEqual(main._read_ollama_content({}, cfg), "result")
+        self.assertEqual([call.args for call in activity.call_args_list], [(0, 3), (6, 3)])
+
     def setUp(self):
         self.cfg = {
             "ollama_url": "http://127.0.0.1:11434/",
@@ -59,6 +83,34 @@ class OllamaChatContentTests(unittest.TestCase):
 
 
 class TranslationBatchTests(unittest.TestCase):
+    @patch("main.ollama_chat_content")
+    def test_runaway_short_title_retries_once_without_context(self, chat):
+        chat.side_effect = ["x" * 513, "基本常识"]
+        self.assertEqual(main.translate_chunk(["基本的なことを学ぶ"], self.cfg, "previous"),
+                         ["基本常識"])
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(chat.call_args.args[0]["options"]["num_predict"], 256)
+        self.assertNotIn("previous_translation", chat.call_args.args[0]["messages"][0]["content"])
+
+    @patch("main.ollama_chat_content")
+    def test_copied_context_is_retried_without_previous_translation(self, chat):
+        context = "「喂，哥哥，你没事吧？」"
+        chat.side_effect = [context + "\n\n他看着我。", "他看着我。"]
+        self.assertEqual(main.translate_chunk(["彼が私を見ている。"], self.cfg, context), ["他看着我。"])
+        self.assertEqual(chat.call_count, 2)
+        self.assertNotIn(context, chat.call_args.args[0]["messages"][0]["content"])
+
+    @patch("main.ollama_chat_content")
+    def test_different_sources_with_duplicate_translation_are_retried(self, chat):
+        chat.side_effect = ["这是错误的重复译文内容。\n\n这是错误的重复译文内容。", "早安。", "我们走吧。"]
+        self.assertEqual(main.translate_chunk(["おはよう。", "移動するぞ。"], self.cfg),
+                         ["早安。", "我們走吧。"])
+
+    @patch("main.ollama_chat_content", return_value="你好。")
+    def test_translation_disables_model_thinking(self, chat):
+        self.assertEqual(main.translate_chunk(["こんにちは。"], self.cfg), ["你好。"])
+        self.assertIs(chat.call_args.args[0]["think"], False)
+
     def setUp(self):
         self.cfg = {
             "ollama_url": "http://127.0.0.1:11434",
@@ -152,6 +204,37 @@ class ModelCheckTests(unittest.TestCase):
 
 
 class TranslationBookTests(unittest.TestCase):
+    def test_bilingual_export_preserves_original_and_reuses_translation(self):
+        import zipfile
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            source = folder / "source.epub"
+            source.write_bytes(b"source")
+            original = main.SourceChapter(url="one", title="章", paragraphs=["學校", "原文二"],
+                blocks=[{"type": "text", "text": "學校"},
+                        {"type": "image", "url": "image"},
+                        {"type": "text", "text": "原文二"}])
+            translated = main._translated_chapter(original, ["學校譯文", "譯文二"])
+            book = main.TranslationBook(source, folder, {"title": "小說"}, "简体中文")
+            book.save(1, original, translated)
+            bilingual = main.TranslationBook(source, folder, {"title": "小說"},
+                                             "简体中文", bilingual=True)
+            self.assertTrue(bilingual.completed(1, original))
+            chapter = bilingual._chapters(1, 1)[0]
+            self.assertEqual([b.get("text", b.get("url")) for b in chapter.blocks],
+                             ["學校", "學校譯文", "image", "原文二", "譯文二"])
+            output = bilingual.finish(1)
+            self.assertIn("_双语对照", output.stem)
+            self.assertNotEqual(output, book.output)
+            with zipfile.ZipFile(output) as archive:
+                text = "\n".join(archive.read(name).decode("utf-8")
+                                 for name in archive.namelist() if name.endswith(".xhtml"))
+            self.assertIn('class="original">學校', text)
+            self.assertIn('class="translation">学校译文', text)
+            self.assertLess(text.index('class="original">學校'),
+                            text.index('class="translation">学校译文'))
+            self.assertEqual(book.state["chapters"][0]["paragraphs"], ["學校譯文", "譯文二"])
+
     def test_ten_chapter_parts_hundred_chapter_merges_and_final_merge(self):
         with TemporaryDirectory() as temporary:
             work_dir = Path(temporary)

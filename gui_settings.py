@@ -13,9 +13,15 @@ from main import installed_models
 
 
 def model_choices(installed: list[str], selected: str) -> list[str]:
-    """Keep the selected model visible alongside installed and recommended models."""
-    return list(dict.fromkeys(name for name in
-                              [*installed, selected.strip(), *TRANSLATION_MODELS.values()] if name))
+    """Only offer models actually installed at the configured endpoint."""
+    return sorted(set(installed))
+
+
+def apply_installed_models(box, variable, names, preferred=""):
+    choices = model_choices(names, preferred)
+    box.configure(values=choices)
+    if variable.get() not in choices:
+        variable.set(preferred if preferred in choices else (choices[0] if choices else ""))
 
 
 class SettingsDialog(tk.Toplevel):
@@ -36,10 +42,11 @@ class SettingsDialog(tk.Toplevel):
         model_row.pack(fill=tk.X, pady=(4, 4))
         self.model_box = ttk.Combobox(
             model_row, textvariable=self.model_var,
-            values=model_choices([], self.model_var.get()),
+            values=app.tr_model_box["values"],
+            state="readonly",
         )
         self.model_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.model_status = tk.StringVar(value="可选择已安装模型，或输入模型名称。")
+        self.model_status = tk.StringVar(value="请从下拉框选择模型；刷新可读取已部署模型。")
         ttk.Label(frame, textvariable=self.model_status, style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 12))
         ttk.Label(frame, text="Ollama 地址").pack(anchor=tk.W)
         self.url_var = tk.StringVar(value=app.cfg["ollama_url"])
@@ -86,12 +93,17 @@ class SettingsDialog(tk.Toplevel):
                 self.model_status.set("地址已改变，请重新刷新模型。")
                 return
             if error:
+                apply_installed_models(self.model_box, self.model_var, [])
+                if url == self.app.cfg["ollama_url"].rstrip("/"):
+                    apply_installed_models(self.app.tr_model_box, self.app.tr_model_var, [])
                 self.model_status.set(f"读取失败：{error}")
                 return
-            choices = model_choices(names, self.model_var.get())
-            self.model_box.configure(values=choices)
-            self.app.tr_model_box.configure(values=choices)
-            self.model_status.set(f"已读取 {len(names)} 个已安装模型；也可输入模型名称。")
+            apply_installed_models(self.model_box, self.model_var, names, self.app.cfg["model"])
+            if url == self.app.cfg["ollama_url"].rstrip("/"):
+                apply_installed_models(self.app.tr_model_box, self.app.tr_model_var, names,
+                                       self.app.cfg["model"])
+            self.model_status.set(f"已读取 {len(names)} 个已安装模型，请从下拉框选择。" if names
+                                  else "未发现已安装模型；安装后点击刷新模型。")
 
         threading.Thread(target=fetch, daemon=True).start()
         self.app.after(100, show_result)
@@ -102,14 +114,13 @@ class SettingsDialog(tk.Toplevel):
             messagebox.showerror("地址无效", "请输入以 http:// 或 https:// 开头的 Ollama 地址。")
             return
         model = self.model_var.get().strip()
-        if not model:
-            messagebox.showerror("模型无效", "请输入或选择翻译模型。")
-            return
-        update_config({"model": model, "ollama_url": url, "ui_theme": self.app.ui_theme}, CONFIG_PATH)
-        self.app.cfg.update(model=model, ollama_url=url)
+        changes = {"ollama_url": url, "ui_theme": self.app.ui_theme}
+        if model:
+            changes["model"] = model
+        update_config(changes, CONFIG_PATH)
+        self.app.cfg.update(changes)
         self.app.tr_model_var.set(model)
-        if model not in self.app.tr_model_box["values"]:
-            self.app.tr_model_box.configure(values=(*self.app.tr_model_box["values"], model))
+        self.app.tr_model_box.configure(values=self.model_box["values"])
         if (self.theme_var.get() == "深色模式") != (self.app.ui_theme == "dark"):
             self.app._toggle_theme()
         self.destroy()

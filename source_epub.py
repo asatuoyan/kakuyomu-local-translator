@@ -37,6 +37,46 @@ def ensure_not_blocked(page: Page) -> None:
         )
 
 
+def wait_for_source_content(page: Page, *, catalogue: bool) -> None:
+    """Read as soon as content is ready, while allowing slow pages to finish."""
+    page.wait_for_function(
+        r"""
+        ({catalogue, blockMarkers}) => {
+          const bodyText = document.body?.innerText || '';
+          if (blockMarkers.some(marker => bodyText.includes(marker))) return true;
+          if (location.pathname.includes('/auth/login')) return true;
+          if (catalogue) {
+            const node = document.querySelector('#__NEXT_DATA__');
+            try {
+              const state = JSON.parse(node?.textContent || '{}')
+                ?.props?.pageProps?.__APOLLO_STATE__ || {};
+              const workId = location.pathname.match(/\/works\/(\d+)/)?.[1];
+              const work = state[`Work:${workId}`];
+              if (work?.tableOfContentsV2?.some(ref =>
+                state[ref.__ref]?.episodeUnions?.length)) return true;
+            } catch (_) {}
+            const ownPrefix = location.origin + location.pathname.replace(/\/$/, '') + '/episodes/';
+            if ([...document.querySelectorAll('a[href*="/episodes/"]')]
+              .some(a => a.href.startsWith(ownPrefix) && a.textContent.trim())) return true;
+            if ([...document.querySelectorAll(
+              '.p-eplist__subtitle, .p-eplist__sublist a, .novel_sublist2 .subtitle a, .index_box .subtitle a, .subtitle a'
+            )].some(a => a.textContent.trim())) return true;
+          }
+          // Syosetu short stories use the chapter body on their work page.
+          if (!catalogue || location.hostname.endsWith('syosetu.com')) {
+            return [...document.querySelectorAll(
+              '.p-novel__body, #novel_honbun, .p-novel__text, [data-testid="episode-body"], .widget-episodeBody, .js-episode-body, [itemprop="articleBody"], article'
+            )].some(node => node.innerText.trim());
+          }
+          return false;
+        }
+        """,
+        arg={"catalogue": catalogue, "blockMarkers": list(BLOCK_MARKERS)},
+        timeout=30_000,
+    )
+    ensure_not_blocked(page)
+
+
 def open_work_page(page: Page, work_url: str, *, allow_login: bool = False) -> bool:
     """Open a work page and tolerate Kakuyomu's competing login redirect.
 
@@ -164,8 +204,7 @@ def _extract_kakuyomu_work_info(page: Page, work_url: str) -> WorkInfo:
     # One page load is sufficient: the complete ordered TOC is embedded in
     # __NEXT_DATA__.  Do not expand/scroll every section, which can trigger
     # additional lazy-load requests and look like rapid catalogue crawling.
-    page.wait_for_timeout(random.randint(4500, 7000))
-    ensure_not_blocked(page)
+    wait_for_source_content(page, catalogue=True)
     data = page.evaluate(
         r"""
         () => {
@@ -246,8 +285,7 @@ def _extract_kakuyomu_work_info(page: Page, work_url: str) -> WorkInfo:
 def _extract_syosetu_work_info(page: Page, work_url: str) -> WorkInfo:
     if page.url.split("#", 1)[0].rstrip("/") != work_url.rstrip("/"):
         open_work_page(page, work_url)
-    page.wait_for_timeout(random.randint(1500, 3000))
-    ensure_not_blocked(page)
+    wait_for_source_content(page, catalogue=True)
     data = page.evaluate(
         r"""
         () => {
@@ -377,8 +415,7 @@ def fetch_with_backoff(
     for attempt in range(max_retries):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-            page.wait_for_timeout(random.randint(900, 1800))
-            ensure_not_blocked(page)
+            wait_for_source_content(page, catalogue=False)
             return
         except KakuyomuAccessBlocked:
             raise
@@ -477,7 +514,9 @@ def _chapter_html(chapter: SourceChapter, image_paths: dict[str, str], lang: str
     parts = [f"<h1>{html.escape(chapter.title)}</h1>"]
     for block in chapter.blocks:
         if block.get("type") == "text":
-            parts.append(f"<p>{html.escape(block.get('text', ''))}</p>")
+            role = block.get("role")
+            attributes = f' class="{role}"' if role in ("original", "translation") else ""
+            parts.append(f"<p{attributes}>{html.escape(block.get('text', ''))}</p>")
         elif block.get("type") == "image" and block.get("url") in image_paths:
             parts.append(f'<p class="illustration"><img src="{html.escape(image_paths[block["url"]])}" alt="{html.escape(block.get("alt", ""))}"/></p>')
     return "\n".join(parts)
@@ -495,7 +534,7 @@ def build_source_epub(work: WorkInfo, chapters: list[SourceChapter], output: Pat
     if work.description:
         book.add_metadata("DC", "description", work.description)
     css = epub.EpubItem(uid="style", file_name="styles/main.css", media_type="text/css",
-                        content="body{font-family:serif;line-height:1.8}p{margin:.8em 0}img{max-width:100%;height:auto;display:block;margin:1em auto}")
+                        content="body{font-family:serif;line-height:1.8}p{margin:.8em 0}p.original{margin-bottom:.2em}p.translation{margin-top:.2em;padding-left:.6em;border-left:2px solid #aaa}img{max-width:100%;height:auto;display:block;margin:1em auto}")
     book.add_item(css)
     if cover:
         cover_data, cover_media = cover
@@ -640,7 +679,8 @@ def translated_source_epub(metadata: dict[str, Any], chapters: list[SourceChapte
                         paragraphs=[normalize_output(text, language) for text in chapter.paragraphs],
                         images=[dict(image) for image in chapter.images],
                         blocks=[{**block, **{key: normalize_output(block[key], language)
-                                             for key in ("text", "alt") if key in block}}
+                                             for key in ("text", "alt") if key in block
+                                             and block.get("role") != "original"}}
                                 for block in chapter.blocks]) for chapter in chapters]
     work = WorkInfo(url="local-epub:" + output.stem, title=metadata["title"],
                     author=metadata.get("author", ""), description=metadata.get("description", ""),
