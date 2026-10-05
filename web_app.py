@@ -54,9 +54,22 @@ class Application:
                     "history": load_json(self.history_path, []),
                     "model": self.cfg["model"], "ollama_url": self.cfg["ollama_url"]}
 
+    def models(self):
+        from main import installed_models, model_is_installed
+        names = sorted(name for name in installed_models(self.cfg) if name)
+        preferred = self.cfg["model"]
+        selected = next((name for name in names if name == preferred), "")
+        if not selected and model_is_installed(preferred, set(names)):
+            selected = next(name for name in names if name.split(":", 1)[0] == preferred)
+        return {"models": names, "selected": selected or (names[0] if names else ""),
+                "ollama_url": self.cfg["ollama_url"]}
+
     def start(self, body):
         from source_epub import normalize_work_url
         from languages import language_code
+        with self.lock:
+            if self.task["running"]:
+                raise ValueError("已有任务正在运行")
         url = str(body.get("url", "")).strip()
         source = str(body.get("source", "")).strip()
         if url:
@@ -67,6 +80,8 @@ class Application:
         model = str(body.get("model", self.cfg["model"])).strip()
         if not model:
             raise ValueError("请选择或填写模型")
+        from main import ensure_model
+        ensure_model({**self.cfg, "model": model}, interactive=False)
         with self.lock:
             if self.task["running"]:
                 raise ValueError("已有任务正在运行")
@@ -82,9 +97,8 @@ class Application:
         cfg.update(_translation_cancelled=self.cancel.is_set, _capture_first_terms=True,
                    _translation_activity=lambda msg: self.progress(None, msg))
         def worker():
-            from main import ensure_model, translate_epub_language, translation_work_dir, TranslationCancelled
+            from main import translate_epub_language, translation_work_dir, TranslationCancelled
             try:
-                ensure_model(cfg, interactive=False)
                 actual = Path(source)
                 if url:
                     from network_workflow import acquire_source
@@ -161,6 +175,8 @@ def create_server(app, port=0):
                     self.send(Path(__file__).with_name("web_app.html").read_bytes(), "text/html; charset=utf-8")
                 elif route == "/api/status":
                     self.send(app.status())
+                elif route == "/api/models":
+                    self.send(app.models())
                 elif route in ("/api/terms", "/api/export"):
                     path = app.project(query.get("project", [""])[0])
                     result = {"entries": [asdict(e) for e in load_project_glossary(path)]}
@@ -173,7 +189,7 @@ def create_server(app, port=0):
                     self.send(path.read_bytes(), "application/epub+zip", attachment="translation.epub")
                 else:
                     self.send({"error": "Not found"}, status=404)
-            except (ValueError, OSError, KeyError) as exc:
+            except (ValueError, OSError, KeyError, RuntimeError) as exc:
                 self.send({"error": str(exc)}, status=400)
 
         def do_POST(self):
@@ -208,7 +224,7 @@ def create_server(app, port=0):
                     self.send({"error": "Not found"}, status=404)
                     return
                 self.send(result)
-            except (ValueError, OSError, KeyError, TypeError) as exc:
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                 self.send({"error": str(exc)}, status=400)
 
         def log_message(self, *_):

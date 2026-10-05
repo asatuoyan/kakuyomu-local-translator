@@ -55,6 +55,31 @@ class WebAppTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.app.project("../outside")
 
+    def test_models_only_returns_installed_names_and_resolves_default_alias(self):
+        self.app.cfg["model"] = "murasaki"
+        with patch("main.installed_models", return_value={"murasaki:latest", "other:7b", ""}):
+            with urlopen(self.server.url + "api/models") as response:
+                result = json.load(response)
+        self.assertEqual(result["models"], ["murasaki:latest", "other:7b"])
+        self.assertEqual(result["selected"], "murasaki:latest")
+        self.app.cfg["model"] = "missing"
+        with patch("main.installed_models", return_value={"installed:latest"}):
+            self.assertEqual(self.app.models()["selected"], "installed:latest")
+        with patch("main.installed_models", return_value=set()):
+            self.assertEqual(self.app.models()["selected"], "")
+
+    def test_ollama_failure_and_missing_model_are_reported_without_starting(self):
+        with patch("main.installed_models", side_effect=RuntimeError("Ollama unavailable")):
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(self.server.url + "api/models")
+            self.assertEqual(raised.exception.code, 400)
+        with patch("main.installed_models", return_value={"installed:latest"}), patch("web_app.update_config") as save:
+            with self.assertRaises(HTTPError) as raised:
+                self.post("start", {"url": "https://kakuyomu.jp/works/123", "model": "missing"})
+            self.assertEqual(raised.exception.code, 400)
+            self.assertFalse(self.app.task["running"])
+            save.assert_not_called()
+
     def test_read_saved_project_and_download(self):
         atomic_json(self.project / "translation-project.json", {"metadata": {"title": "测试小说"},
                     "language": "簡體中文", "chapters": [{"title": "第一章", "paragraphs": ["里昂"]}]})
