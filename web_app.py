@@ -52,8 +52,29 @@ class Application:
     def status(self):
         with self.lock:
             return {"task": dict(self.task), "projects": self.projects(),
-                    "history": load_json(self.history_path, []),
+                    "history": self.recent_tasks(),
                     "model": self.cfg["model"], "ollama_url": self.cfg["ollama_url"]}
+
+    def recent_tasks(self):
+        from network_workflow import network_path
+        result, seen = [], set()
+        for item in load_json(self.history_path, []):
+            url, source = item.get("url", ""), item.get("source", "")
+            identity = url or source
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            title = item.get("title", "")
+            if url:
+                try:
+                    saved = load_json(network_path(url, self.cfg), {})
+                    title = saved.get("work", {}).get("title") or title
+                except (ValueError, OSError):
+                    pass
+            else:
+                title = title or Path(source).stem
+            result.append({**item, "title": title or "尚未获取书名"})
+        return result
 
     def models(self):
         from main import installed_models, model_is_installed
@@ -75,6 +96,7 @@ class Application:
         source = str(body.get("source", "")).strip()
         if url:
             url = normalize_work_url(url)
+            source = ""
         elif not source or not Path(source).is_file() or Path(source).suffix.lower() != ".epub":
             raise ValueError("请输入小说网址或有效的本地 EPUB 路径")
         language = language_code(body.get("language", "zh-Hans"))
@@ -93,7 +115,8 @@ class Application:
                          "url": url, "source": source, "language": language}
             history = load_json(self.history_path, [])
             item = {"url": url, "source": source, "language": language}
-            atomic_json(self.history_path, [item] + [x for x in history if x != item][:19])
+            identity = url or source
+            atomic_json(self.history_path, [item] + [x for x in history if (x.get("url") or x.get("source")) != identity][:19])
             cfg = dict(self.cfg)
         cfg.update(_translation_cancelled=self.cancel.is_set, _capture_first_terms=True,
                    _translation_activity=lambda msg: self.progress(None, msg),
