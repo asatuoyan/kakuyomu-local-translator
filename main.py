@@ -1450,13 +1450,24 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     normalize_output("", language)  # Check the converter before doing model work.
     work_dir = translation_work_dir(source, cfg, language)
     work_dir.mkdir(parents=True, exist_ok=True)
-    metadata, chapters = extract_epub_chapters(source, work_dir / "assets")
+    if cfg.get("_stream_metadata") is not None:
+        metadata, chapters = dict(cfg["_stream_metadata"]), cfg["_stream_prefix"]
+    else:
+        metadata, chapters = extract_epub_chapters(source, work_dir / "assets")
     source_chapters = chapters
     source_chapter_count = len(chapters)
+    streaming = cfg.get("_chapter_stream") is not None
+    if streaming:
+        chapters = cfg["_chapter_stream"]
+        source_chapter_count = cfg["_stream_total"]
+    total_chapters = source_chapter_count
     if chapter_limit is not None:
+        if streaming:
+            raise ValueError("在线逐章翻译不能同时设置试译范围")
         if isinstance(chapter_limit, bool) or not isinstance(chapter_limit, int) or chapter_limit < 1:
             raise ValueError("试译章节数必须是大于零的整数。")
         chapters = chapters[:chapter_limit]
+        total_chapters = len(chapters)
     chapter_cfg = dict(cfg)
     chapter_cfg["target_language"] = language
     if uses_murasaki_profile(chapter_cfg):
@@ -1506,18 +1517,25 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
 
     completed_units = 0
     total_units = (1 + bool(metadata.get("description"))
-                   + sum(1 + len(ch.paragraphs) for ch in chapters))
+                   + (0 if streaming else sum(1 + len(ch.paragraphs) for ch in chapters)))
+    completed_chapters = 0
+    current_index = 0
 
     def report(message):
         if progress:
-            progress(completed_units / total_units * 99, f"{language} · {message}")
+            percent = completed_chapters / total_chapters * 99 if streaming else completed_units / total_units * 99
+            progress(percent, f"{language} · {message}")
 
     def translate(ep, label, reading=None):
         nonlocal completed_units
         check_cancelled()
         def episode_progress(done, total):
             if progress:
-                percent = (completed_units + done) / total_units * 99
+                if streaming:
+                    percent = ((current_index - 1 + done / max(1, total)) / total_chapters * 99
+                               if current_index else 0)
+                else:
+                    percent = (completed_units + done) / total_units * 99
                 progress(percent, f"{language} · {label} · 段落 {done}/{total}")
 
         local_cfg = dict(chapter_cfg)
@@ -1545,10 +1563,11 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     book = TranslationBook(source, work_dir, metadata, language, source_chapters,
                            bilingual=cfg.get("bilingual_output", False))
     for index, chapter in enumerate(chapters, 1):
+        current_index = index
         check_cancelled()
-        label = f"章节 {index}/{len(chapters)} · {chapter.title}"
+        label = f"章节 {index}/{total_chapters} · {chapter.title}"
         report(label)
-        print(f"[{language} {index}/{len(chapters)}] {chapter.title}", flush=True)
+        print(f"[{language} {index}/{total_chapters}] {chapter.title}", flush=True)
         if not book.completed(index, chapter):
             title_ep = Episode(url=chapter.url + "#title", work_title="", episode_title=chapter.title,
                                paragraphs=[chapter.title], blocks=[{"type": "text", "text": chapter.title}])
@@ -1571,10 +1590,24 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
             report(f"{label} · 保存首次译名")
             additions = capture_terms(chapter.paragraphs, record["paragraphs"], chapter_cfg, work_dir)
             chapter_cfg["glossary"].update(entries_to_dict(additions))
+        completed_chapters = index
+        if cfg.get("_chapter_completed"):
+            cfg["_chapter_completed"](index)
     check_cancelled()
+    if streaming:
+        if completed_chapters != total_chapters:
+            raise ValueError("获取章节未完成，保留已翻译进度。")
+        final_source = cfg["_stream_finalize"]()
+        final_metadata, _ = extract_epub_chapters(final_source, work_dir / "assets")
+        for key in ("cover_path", "cover_media_type"):
+            if key in final_metadata:
+                book.metadata[key] = final_metadata[key]
+        book.state["source_hash"] = hashlib.sha256(final_source.read_bytes()).hexdigest()
+        book.state["source_path"] = str(final_source.resolve())
+        save_translation_state(book.path, book.state)
     report("正在生成 EPUB")
     if chapter_limit is None:
-        output = book.finish(len(chapters))
+        output = book.finish(total_chapters)
     else:
         # A preview must never replace an existing full-book export or truncate its project.
         output = book.output.with_name(f"{book.output.stem}_试译_0001-{len(chapters):04d}.epub")

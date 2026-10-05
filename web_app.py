@@ -101,13 +101,13 @@ class Application:
             try:
                 actual = Path(source)
                 if url:
-                    from network_workflow import acquire_source
-                    actual, _ = acquire_source(url, cfg, 1, full=True,
-                                               progress=lambda p, m: self.progress(p * .3, m))
-                work_dir = translation_work_dir(actual, cfg, language)
-                self.progress(30 if url else 0, "开始翻译，默认保存首次译名…")
-                output = translate_epub_language(actual, cfg, language,
-                    lambda p, m: self.progress(30 + p * .7 if url else p, m))
+                    from streaming_workflow import run_streaming_workflow
+                    actual, output, work_dir = run_streaming_workflow(url, cfg, language,
+                        progress=self.progress, counts=self.pipeline_counts)
+                else:
+                    work_dir = translation_work_dir(actual, cfg, language)
+                    self.progress(0, "开始翻译，默认保存首次译名…")
+                    output = translate_epub_language(actual, cfg, language, self.progress)
                 with self.lock:
                     self.task.update(percent=100, message="翻译完成", output=str(output),
                                      project=str(work_dir.relative_to(Path(cfg["output_dir"]))))
@@ -125,6 +125,10 @@ class Application:
             self.task["message"] = message
             if percent is not None:
                 self.task["percent"] = round(percent, 1)
+
+    def pipeline_counts(self, counts):
+        with self.lock:
+            self.task["counts"] = counts
 
     def write_terms(self, body):
         with self.lock:

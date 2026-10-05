@@ -26,7 +26,7 @@ def _wait(seconds, cfg):
         time.sleep(min(.2, max(0, end - time.monotonic())))
 
 
-def acquire_source(url, cfg, count, *, full=False, progress=None):
+def acquire_source(url, cfg, count, *, full=False, progress=None, work_ready=None, chapter_ready=None):
     from main import _launch_context, select_active_page, check_translation_cancelled
     url = normalize_work_url(url)
     path = network_path(url, cfg)
@@ -64,11 +64,14 @@ def acquire_source(url, cfg, count, *, full=False, progress=None):
             current_urls = [item["url"] for item in work.episodes]
             if previous_urls and current_urls[:len(previous_urls)] != previous_urls:
                 raise ValueError("已获取章节的目录顺序发生变化，请核对后使用新的项目。")
+            if work_ready:
+                work_ready(source, work, cache)
             chapters = []
             for i, item in enumerate(selected, 1):
                 check_translation_cancelled(cfg)
                 if progress:
                     progress((i - 1) / len(selected) * 100, f"获取 {i}/{len(selected)} · {item['title']}")
+                fresh = False
                 record = cache.get(item["url"])
                 if record and record.get("paragraphs"):
                     images = []
@@ -80,6 +83,7 @@ def acquire_source(url, cfg, count, *, full=False, progress=None):
                     chapter = SourceChapter(url=item["url"], title=record["title"],
                                             paragraphs=record["paragraphs"], blocks=record["blocks"], images=images)
                 else:
+                    fresh = True
                     chapter = extract_source_chapter(page, item["url"], item["title"])
                     check_translation_cancelled(cfg)
                     download_chapter_images(context, chapter)
@@ -93,8 +97,15 @@ def acquire_source(url, cfg, count, *, full=False, progress=None):
                     cache[item["url"]] = {"title": chapter.title, "paragraphs": chapter.paragraphs,
                                           "blocks": chapter.blocks, "images": images}
                     atomic_json(cache_path, cache)
-                    _wait(max(8, float(cfg.get("request_delay_seconds", 8))) + random.uniform(1, 3.5), cfg)
                 chapters.append(chapter)
+                if chapter_ready:
+                    state.update(work=asdict(work), total_chapters=len(work.episodes))
+                    if len(chapters) >= state.get("acquired_chapters", 0):
+                        state.update(source_urls=[c.url for c in chapters], acquired_chapters=len(chapters))
+                    atomic_json(path, state)
+                    chapter_ready(i, chapter)
+                if fresh:
+                    _wait(max(8, float(cfg.get("request_delay_seconds", 8))) + random.uniform(1, 3.5), cfg)
             check_translation_cancelled(cfg)
             cover = None
             if state.get("cover_media") and (folder / "cover.bin").exists():

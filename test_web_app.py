@@ -93,21 +93,20 @@ class WebAppTests(unittest.TestCase):
         finally:
             self.app.reader.close()
 
-    def test_task_acquires_full_book_then_translates_with_first_names(self):
+    def test_task_uses_streaming_acquisition_with_first_names(self):
         event = threading.Event()
         source = Path(self.tmp.name) / "source.epub"
         source.write_bytes(b"epub")
         output = self.project / "translated.epub"
-        def translate(actual, cfg, language, progress):
+        def translate(url, cfg, language, progress, counts):
             self.assertTrue(cfg["_capture_first_terms"])
-            self.assertEqual(actual, source)
+            self.assertEqual(url, "https://kakuyomu.jp/works/123")
+            counts({"acquired": 1, "translated": 1, "total": 1})
             progress(100, "完成")
             event.set()
-            return output
+            return source, output, self.project
         with patch("web_app.update_config"), patch("main.ensure_model"), \
-             patch("network_workflow.acquire_source", return_value=(source, None)) as acquire, \
-             patch("main.translation_work_dir", return_value=self.project), \
-             patch("main.translate_epub_language", side_effect=translate):
+             patch("streaming_workflow.run_streaming_workflow", side_effect=translate) as stream:
             self.app.start({"url": "https://kakuyomu.jp/works/123", "language": "zh-Hans", "model": "test"})
             self.assertTrue(event.wait(5))
             for _ in range(100):
@@ -115,5 +114,6 @@ class WebAppTests(unittest.TestCase):
                     break
                 threading.Event().wait(.01)
             self.assertFalse(self.app.task["running"])
-            self.assertTrue(acquire.call_args.kwargs["full"])
+            stream.assert_called_once()
+            self.assertEqual(self.app.task["counts"]["translated"], 1)
             self.assertEqual(self.app.task["project"], "book")
