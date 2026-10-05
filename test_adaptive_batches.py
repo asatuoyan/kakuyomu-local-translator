@@ -3,6 +3,17 @@ from adaptive_batches import AdaptiveBatcher
 
 
 class AdaptiveBatchTests(unittest.TestCase):
+    def test_murasaki_keeps_short_chapter_whole_within_context_and_respects_degradation(self):
+        paragraphs = ["原" * 100] * 14
+        batcher = AdaptiveBatcher({"model": "murasaki-8b:latest", "target_language": "简体中文"}, 16384)
+        self.assertEqual(batcher.take(paragraphs), paragraphs)
+        batcher.context_length = 4096
+        self.assertLess(len(batcher.take(paragraphs)), len(paragraphs))
+        batcher.context_length = 16384
+        batcher.mark_degraded()
+        batcher.observe(1)
+        self.assertLess(len(batcher.take(paragraphs)), len(paragraphs))
+
     def test_hy_mt_prefers_whole_chapter_if_budget_allows(self):
         paragraphs = ["原" * 100] * 15
         cfg = {"model": "hy-mt2-30b:latest"}

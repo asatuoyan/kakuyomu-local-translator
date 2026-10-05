@@ -1,6 +1,7 @@
 """Conservative batch sizing using context estimates and observed request results."""
 from model_batch_presets import model_batch_preset
 from hy_mt_profile import uses_hy_mt_30b_profile
+from murasaki_profile import uses_murasaki_profile
 
 
 class AdaptiveBatcher:
@@ -9,6 +10,7 @@ class AdaptiveBatcher:
         self.context_length = context_length
         self.preset = model_batch_preset(cfg.get("model", ""))
         self.hy_mt_30b = uses_hy_mt_30b_profile(cfg)
+        self.murasaki = uses_murasaki_profile(cfg) if cfg.get("target_language") else False
         self.ceiling = min(self.preset.ceiling, max(1, int(cfg.get("translation_chunk_chars", 2200))))
         self.item_ceiling = max(1, int(cfg.get("translation_chunk_paragraphs", 40)))
         self.chars = min(self.ceiling, self.preset.chars)
@@ -29,6 +31,10 @@ class AdaptiveBatcher:
             # Stay below the profile's 4096 output-token recommendation.
             budget = min(budget, (4096 - 256) // 2)
         limit = min(self.chars, self.ceiling, budget)
+        if (self.murasaki and sum(map(len, remaining)) <= min(self.ceiling, budget)
+                and len(remaining) <= self.item_ceiling and not self.degraded):
+            self.degraded = False
+            return list(remaining)
         if (self.hy_mt_30b and self.cfg.get("hy_mt_prefer_whole_chapter", True)
                 and sum(map(len, remaining)) <= min(self.ceiling, budget)
                 and len(remaining) <= self.item_ceiling):

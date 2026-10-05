@@ -465,19 +465,8 @@ def translate_chunk(
     check_translation_cancelled(cfg)
     if not paragraphs:
         return []
-    references = []
-    if cfg.get("glossary"):
-        references.append(f"参考下面的翻译：\n{glossary_text(cfg)}")
-    context_chars = max(0, int(cfg.get("context_chars", 1200)))
-    if previous_context and context_chars:
-        references.append(f"<previous_translation>\n{previous_context[-context_chars:]}\n</previous_translation>\n"
-                          "以上是已完成译文，仅供理解人物关系。禁止复制、续写或再次输出以上内容。")
-    instruction = f"将以下文本翻译为{language_name(cfg['target_language'])}，只输出翻译结果，不要额外解释。"
-    if len(paragraphs) > 1:
-        instruction += "保持段落数量和顺序，段落之间保留一个空行。"
-    user = "\n\n".join([*references, instruction,
-                           "只翻译 <source_text> 内的原文，输出不包含标签。",
-                           "<source_text>\n" + "\n\n".join(paragraphs) + "\n</source_text>"])
+    from translation_prompt import build_prompt, has_prompt_echo
+    user = build_prompt(paragraphs, cfg, previous_context)
     source_chars = sum(map(len, paragraphs))
     request_cfg = dict(cfg)
     # Allow expansion across languages while bounding runaway generations for
@@ -535,6 +524,14 @@ def translate_chunk(
     content = normalize_text(content)
     if not content:
         raise RuntimeError("模型没有返回译文。")
+    if has_prompt_echo(content, paragraphs):
+        if cfg.get("_batch_degraded"):
+            cfg["_batch_degraded"]()
+        if _context_retry:
+            raise RuntimeError("译文混入翻译指令，未保存该批次。")
+        print("  译文混入翻译指令，移除前文参考并逐段重试……", flush=True)
+        return [translate_chunk([paragraph], cfg, "", _context_retry=True, _repeat_retry=murasaki)[0]
+                for paragraph in paragraphs]
     translations = [content] if len(paragraphs) == 1 else re.split(r"\n\s*\n", content)
     if len(translations) != len(paragraphs):
         returned_count = len(translations)
@@ -547,11 +544,11 @@ def translate_chunk(
                 "自動拆成較小批次重試……",
                 flush=True,
             )
-            first = translate_chunk(paragraphs[:midpoint], cfg, previous_context)
+            first = translate_chunk(paragraphs[:midpoint], cfg, previous_context, _repeat_retry=murasaki)
             continued_context = "\n".join(
                 part for part in [previous_context, *first] if part
             )
-            second = translate_chunk(paragraphs[midpoint:], cfg, continued_context)
+            second = translate_chunk(paragraphs[midpoint:], cfg, continued_context, _repeat_retry=murasaki)
             return first + second
         raise RuntimeError(
             f"模型回傳 {returned_count} 段，但預期 1 段。"
@@ -574,7 +571,7 @@ def translate_chunk(
         if _context_retry:
             raise RuntimeError("译文重复前文或不同原文返回相同译文，未保存该批次。")
         print("  译文疑似重复前文，移除译文参考并逐段重试……", flush=True)
-        return [translate_chunk([paragraph], cfg, "", _context_retry=True)[0]
+        return [translate_chunk([paragraph], cfg, "", _context_retry=True, _repeat_retry=murasaki)[0]
                 for paragraph in paragraphs]
     return results
 
@@ -653,6 +650,7 @@ def translate_episode(episode: Episode, cfg: dict[str, Any], work_dir: Path) -> 
 
 
 def _translate_episode(episode: Episode, cfg: dict[str, Any], cache: TranslationCache) -> list[str]:
+    from translation_prompt import has_prompt_echo
     check_translation_cancelled(cfg)
     translated: list[str] = []
     missing: list[str] = []
@@ -674,7 +672,7 @@ def _translate_episode(episode: Episode, cfg: dict[str, Any], cache: Translation
         key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
         keys.append(key)
         cached = cache.get(key)
-        if cached is not None and not cfg.get("_force_retranslate"):
+        if cached is not None and not cfg.get("_force_retranslate") and not has_prompt_echo(cached, [paragraph]):
             translated.append(cached)
         else:
             translated.append("")
@@ -708,6 +706,10 @@ def _translate_episode(episode: Episode, cfg: dict[str, Any], cache: Translation
                 context_limit = (reference_context_limit(cfg) if uses_hy_mt_30b_profile(cfg)
                                  else int(cfg.get("context_chars", 1200)))
                 reference_chars = min(len(context), context_limit) + len(glossary_text(cfg))
+                if uses_murasaki_profile(cfg):
+                    from murasaki_profile import relevant_glossary
+                    reference_cfg = {**cfg, "glossary": relevant_glossary(missing[cursor:], cfg.get("glossary", {}))}
+                    reference_chars = len(glossary_text(reference_cfg))
                 batch = controller.take(missing[cursor:], reference_chars)
             else:
                 batch = make_batches(missing[cursor:], int(cfg.get("translation_chunk_chars", 2200)),

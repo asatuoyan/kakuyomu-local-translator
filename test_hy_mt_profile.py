@@ -38,10 +38,10 @@ class HyMTProfileTests(unittest.TestCase):
         self.assertEqual(main.translate_chunk(["一", "二"], self.cfg, "a" * 20), ["One.", "Two."])
         prompt = chat.call_args.args[0]["messages"][0]["content"]
         self.assertIn("魔王 翻译成 Demon King", prompt)
-        self.assertIn("翻译为英语", prompt)
+        self.assertIn("翻译为英文", prompt)
         self.assertIn("〖背景信息〗\n" + "a" * 10 + "\n", prompt)
-        self.assertTrue(prompt.endswith("〖待翻译文本〗\n一\n\n二"))
-        self.assertLess(prompt.index("输出要求"), prompt.index("将以下文本翻译为"))
+        self.assertTrue(prompt.endswith("<source_text>\n一\n\n二\n</source_text>"))
+        self.assertLess(prompt.index("输出要求"), prompt.index("<source_text>\n"))
 
     @patch("main.ollama_chat_content")
     def test_length_limit_retries_with_penalty_and_no_context(self, chat):
