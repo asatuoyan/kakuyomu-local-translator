@@ -1441,7 +1441,7 @@ def translation_work_dir(source: Path, cfg: dict[str, Any], language: str) -> Pa
 
 
 def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
-                            progress=None) -> Path:
+                            progress=None, *, chapter_limit: int | None = None) -> Path:
     """One resumable language job, shared by the GUI and command line."""
     check_translation_cancelled(cfg)
     language = language_name(language)
@@ -1449,6 +1449,12 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     work_dir = translation_work_dir(source, cfg, language)
     work_dir.mkdir(parents=True, exist_ok=True)
     metadata, chapters = extract_epub_chapters(source, work_dir / "assets")
+    source_chapters = chapters
+    source_chapter_count = len(chapters)
+    if chapter_limit is not None:
+        if isinstance(chapter_limit, bool) or not isinstance(chapter_limit, int) or chapter_limit < 1:
+            raise ValueError("试译章节数必须是大于零的整数。")
+        chapters = chapters[:chapter_limit]
     chapter_cfg = dict(cfg)
     chapter_cfg["target_language"] = language
     if uses_murasaki_profile(chapter_cfg):
@@ -1534,7 +1540,7 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     metadata["title"] = final[0]
     if len(final) > 1:
         metadata["description"] = final[1]
-    book = TranslationBook(source, work_dir, metadata, language, chapters,
+    book = TranslationBook(source, work_dir, metadata, language, source_chapters,
                            bilingual=cfg.get("bilingual_output", False))
     for index, chapter in enumerate(chapters, 1):
         check_cancelled()
@@ -1557,9 +1563,22 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
                 cfg["_reading_update"](language, index, record["title"], chapter.paragraphs,
                                        [normalize_output(t, language) for t in record["paragraphs"]])
         report(f"{label} · 已保存")
+        if cfg.get("_capture_first_terms"):
+            from first_translation_terms import capture_terms
+            record = book.state["chapters"][index - 1]
+            report(f"{label} · 保存首次译名")
+            additions = capture_terms(chapter.paragraphs, record["paragraphs"], chapter_cfg, work_dir)
+            chapter_cfg["glossary"].update(entries_to_dict(additions))
     check_cancelled()
     report("正在生成 EPUB")
-    output = book.finish(len(chapters))
+    if chapter_limit is None:
+        output = book.finish(len(chapters))
+    else:
+        # A preview must never replace an existing full-book export or truncate its project.
+        output = book.output.with_name(f"{book.output.stem}_试译_0001-{len(chapters):04d}.epub")
+        book._build(1, len(chapters), output)
+        book.state["source_chapter_count"] = source_chapter_count
+        save_translation_state(book.path, book.state)
     if progress:
         progress(100.0, f"{language} · 已完成")
     return output

@@ -1,5 +1,6 @@
 """Serve live reading snapshots to local and LAN browsers."""
 import json
+import re
 import secrets
 import socket
 import subprocess
@@ -8,6 +9,18 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
+
+
+def load_saved_reading(path):
+    """Compatibility adapter for callers requesting all saved text."""
+    from saved_reading import SavedReading
+    book = SavedReading(path)
+    payloads = []
+    for index, entry in enumerate(book.catalog, 1):
+        record = book.chapter(entry["id"])
+        payloads.append((book.language, index, record["title"],
+                         record["originals"], record["translations"]))
+    return book.identity, book.title, payloads
 
 
 def physical_lan_addresses():
@@ -40,6 +53,7 @@ class ReadingServer:
     def __init__(self):
         self.lock = threading.Lock()
         self.book = ""
+        self.saved = None
         self.chapters = {}
         self.revision = 0
         self.token = secrets.token_urlsafe(24)
@@ -54,13 +68,31 @@ class ReadingServer:
                     mime = "text/html; charset=utf-8"
                 elif path.path in (prefix + "/catalog", prefix + "/chapter"):
                     with owner.lock:
+                        saved = owner.saved
                         if path.path.endswith("catalog"):
-                            result = {"book": owner.book, "chapters": [
-                                {"id": key, "title": value["title"], "revision": value["revision"]}
-                                for key, value in owner.chapters.items()]}
+                            entries = []
+                            volumes = {}
+                            for key, value in sorted(owner.chapters.items(), key=lambda item: (item[1]["language"], item[1]["index"])):
+                                language = value["language"]
+                                match = re.search(r"第\s*[0-9０-９一二三四五六七八九十百千零〇两壱弐参]+\s*[卷巻部]", value["chapter_title"])
+                                if match:
+                                    volumes[language] = match.group(0)
+                                entries.append({"id": key, "title": value["title"],
+                                                "revision": value["revision"], "language": language,
+                                                "volume": volumes.get(language, "未分卷")})
+                            result = {"book": owner.book, "chapters": entries}
                         else:
                             key = parse_qs(path.query).get("id", [""])[0]
                             result = owner.chapters.get(key)
+                    if saved is not None:
+                        try:
+                            result = ({"book": saved.identity, "title": saved.title, "chapters": saved.catalog}
+                                      if path.path.endswith("catalog") else saved.chapter(key))
+                            if result is not None and path.path.endswith("chapter"):
+                                result = {**result, "revision": saved.revision}
+                        except (OSError, ValueError, KeyError) as exc:
+                            self.send_error(500, "Chapter could not be loaded")
+                            return
                     data = json.dumps(result, ensure_ascii=False).encode("utf-8")
                     mime = "application/json; charset=utf-8"
                 else:
@@ -105,6 +137,17 @@ class ReadingServer:
     def reset(self, book):
         with self.lock:
             self.book = book
+            self.saved = None
+            self.chapters.clear()
+
+    def open_saved(self, saved):
+        with self.lock:
+            self.revision += 1
+            saved.revision = self.revision
+            for entry in getattr(saved, "catalog", []):
+                entry["revision"] = saved.revision
+            self.book = saved.identity
+            self.saved = saved
             self.chapters.clear()
 
     def update(self, payload):
@@ -112,6 +155,7 @@ class ReadingServer:
         with self.lock:
             self.revision += 1
             self.chapters[f"{language}:{index}"] = {
+                "language": language, "index": index, "chapter_title": title,
                 "title": f"{language} · {index} · {title}", "revision": self.revision,
                 "originals": list(originals), "translations": list(translations)}
 
