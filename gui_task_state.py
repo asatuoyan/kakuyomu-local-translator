@@ -8,7 +8,8 @@ from source_epub import WorkInfo
 
 
 class TaskStateMixin:
-    def _set_busy(self, busy: bool, status_msg: str = ""):
+    def _set_busy(self, busy: bool, status_msg: str = "", *, cancellable: bool = False):
+        self.task_busy = busy
         if busy:
             self._busy_button_states = []
 
@@ -16,7 +17,7 @@ class TaskStateMixin:
                 for widget in parent.winfo_children():
                     if (isinstance(widget, (ttk.Button, tk.Button))
                             and widget not in (self.log_toggle, self.function_button,
-                                               self.settings_button)
+                                               self.settings_button, self.btn_stop)
                             and widget not in self.navigation_buttons):
                         self._busy_button_states.append((widget, str(widget.cget("state"))))
                         widget.configure(state=tk.DISABLED)
@@ -31,6 +32,7 @@ class TaskStateMixin:
         if busy:
             self.status_var.set(status_msg)
             self.progress_var.set(0.0)
+            self.btn_stop.configure(state=tk.NORMAL if cancellable else tk.DISABLED)
             if hasattr(self, "btn_start_dl"):
                 self.btn_start_dl.config(state=tk.DISABLED)
             if hasattr(self, "btn_start_tr"):
@@ -43,6 +45,10 @@ class TaskStateMixin:
                 self.btn_start_tr.config(state=tk.NORMAL)
             if hasattr(self, "btn_stop"):
                 self.btn_stop.config(state=tk.DISABLED)
+            if hasattr(self, "_sync_workflow"):
+                self._sync_workflow()
+            if hasattr(self, "_sync_network_workflow"):
+                self._sync_network_workflow()
 
     def _poll_queue(self):
         try:
@@ -54,9 +60,20 @@ class TaskStateMixin:
                     self.progress_var.set(payload)
                 elif msg_type == "reading":
                     self._update_reading(payload)
+                elif msg_type == "saved_reading_ready":
+                    self._saved_reading_ready(payload)
+                elif msg_type == "workflow_complete":
+                    self._workflow_complete(payload)
+                elif msg_type == "network_source_ready":
+                    self._network_source_ready(payload)
+                elif msg_type == "saved_reading_error":
+                    self.saved_reading_loading = False
+                    self.status_var.set("小说读取失败")
+                    self._dialogs.showerror("小说读取失败", payload)
                 elif msg_type == "status":
                     self.status_var.set(payload)
                 elif msg_type == "error":
+                    self.workflow_running = False
                     self._set_busy(False)
                     self.status_var.set("執行未完成 · 請查看日誌")
                     if self.audit_state_var.get() == "检查中":
@@ -93,6 +110,7 @@ class TaskStateMixin:
                     self._append_log(f"EPUB 翻译完成：\n{payload}\n")
                     self._dialogs.showinfo("翻譯完成", f"各語言 EPUB 已成功生成：\n{payload}")
                 elif msg_type == "translate_stopped":
+                    self.workflow_running = False
                     self._set_busy(False)
                 elif msg_type == "candidates_ready":
                     self._set_busy(False)

@@ -11,6 +11,148 @@ from gui_settings import SettingsDialog
 
 
 class GuiStateTests(unittest.TestCase):
+    def test_network_workflow_starts_without_manual_catalog_or_epub_selection(self):
+        old_model = self.app.tr_model_var.get()
+        old_url = self.app.dl_url_var.get()
+        old_running = getattr(self.app, "workflow_running", False)
+        old_stop = self.app.stop_requested
+        try:
+            self.app.tr_model_var.set("test-model")
+            self.app.dl_url_var.set("https://kakuyomu.jp/works/123")
+            with patch("gui_workflow.threading.Thread") as thread:
+                self.app._action_network_workflow()
+            thread.return_value.start.assert_called_once()
+            self.assertTrue(self.app.task_busy)
+            self.assertEqual(str(self.app.btn_stop.cget("state")), "normal")
+        finally:
+            self.app.workflow_running = old_running
+            self.app.stop_requested = old_stop
+            self.app._set_busy(False)
+            self.app.tr_model_var.set(old_model)
+            self.app.dl_url_var.set(old_url)
+
+    def test_full_confirmation_on_translation_page_dispatches_online_acquisition(self):
+        previous = getattr(self.app, "workflow_state", {})
+        try:
+            self.app.workflow_state = {"network_url": "https://kakuyomu.jp/works/123"}
+            with patch.object(self.app, "_sync_workflow"), patch.object(self.app, "_action_network_workflow") as run:
+                self.app._action_start_translate(preview=False)
+            run.assert_called_once_with(full=True, url="https://kakuyomu.jp/works/123")
+        finally:
+            self.app.workflow_state = previous
+
+    def test_workflow_restores_preview_gate_and_disables_full_for_another_book(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from project_storage import atomic_json
+        from translation_workflow import workflow_path
+        old_cfg = self.app.cfg
+        old_source = self.app.tr_epub_var.get()
+        old_languages = {code: var.get() for code, var in self.app.tr_language_vars.items()}
+        try:
+            with TemporaryDirectory() as directory:
+                source = Path(directory) / "book.epub"
+                source.write_bytes(b"source")
+                self.app.cfg = {**old_cfg, "output_dir": directory}
+                for code, var in self.app.tr_language_vars.items():
+                    var.set(code == "zh-Hans")
+                self.app.tr_epub_var.set(str(source))
+                self.assertEqual(str(self.app.btn_full_tr.cget("state")), "disabled")
+                atomic_json(workflow_path(source, self.app.cfg), {
+                    "source": str(source.resolve()), "stage": "awaiting_confirmation",
+                    "previews": {"zh-Hans": {"chapters": 20, "issues": 2}}})
+                self.app._sync_workflow()
+                self.assertEqual(str(self.app.btn_full_tr.cget("state")), "normal")
+                self.app._set_busy(True, "试译", cancellable=True)
+                self.assertEqual(str(self.app.btn_full_tr.cget("state")), "disabled")
+                self.app._set_busy(False)
+                self.assertEqual(str(self.app.btn_full_tr.cget("state")), "normal")
+                self.app.tr_epub_var.set(str(Path(directory) / "other.epub"))
+                self.assertEqual(str(self.app.btn_full_tr.cget("state")), "disabled")
+        finally:
+            self.app.cfg = old_cfg
+            self.app.tr_epub_var.set(old_source)
+            for code, value in old_languages.items():
+                self.app.tr_language_vars[code].set(value)
+            self.app._set_busy(False)
+
+    def test_download_button_remains_inside_default_and_minimum_window(self):
+        self.app.deiconify()
+        self.addCleanup(self.app.withdraw)
+        self.app._select_page("download")
+        for size in ("1120x760", "980x680"):
+            with self.subTest(size=size):
+                self.app.geometry(size)
+                self.app.update()
+                button = self.app.btn_start_dl
+                page = self.app.tab_download
+                self.assertTrue(button.winfo_viewable())
+                self.assertGreater(button.winfo_height(), 20)
+                self.assertGreaterEqual(button.winfo_rooty(), page.winfo_rooty())
+                self.assertLessEqual(button.winfo_rooty() + button.winfo_height(),
+                                     page.winfo_rooty() + page.winfo_height())
+                for action in (self.app.btn_network_preview, self.app.btn_network_full):
+                    self.assertTrue(action.winfo_viewable())
+                    self.assertLessEqual(action.winfo_rooty() + action.winfo_height(),
+                                         page.winfo_rooty() + page.winfo_height())
+
+    def test_new_download_resets_previous_stop_request(self):
+        from source_epub import WorkInfo
+        previous_work = self.app.current_work
+        previous_stop = self.app.stop_requested
+        try:
+            self.app.current_work = WorkInfo("https://kakuyomu.jp/works/1", "测试", "", "", "",
+                                             [{"url": "https://kakuyomu.jp/works/1/episodes/2", "title": "第一章"}])
+            self.app.dl_start_var.set("1")
+            self.app.dl_end_var.set("1")
+            self.app.stop_requested = True
+            with patch("gui.threading.Thread") as worker:
+                self.app._action_start_download()
+            self.assertFalse(self.app.stop_requested)
+            worker.return_value.start.assert_called_once()
+            self.assertEqual(str(self.app.btn_stop.cget("state")), "normal")
+            self.app.btn_stop.invoke()
+            self.assertTrue(self.app.stop_requested)
+        finally:
+            self.app.current_work = previous_work
+            self.app.stop_requested = previous_stop
+            self.app._set_busy(False)
+
+    def test_stop_is_enabled_for_cancellable_tasks_and_disabled_when_finished(self):
+        previous_stop = self.app.stop_requested
+        try:
+            self.app.stop_requested = False
+            self.app._set_busy(True, "翻译中", cancellable=True)
+            self.assertEqual(str(self.app.btn_start_tr.cget("state")), "disabled")
+            self.assertEqual(str(self.app.btn_stop.cget("state")), "normal")
+            self.app.btn_stop.invoke()
+            self.assertTrue(self.app.stop_requested)
+            self.app._set_busy(False)
+            self.assertEqual(str(self.app.btn_stop.cget("state")), "disabled")
+            self.app._set_busy(True, "读取目录")
+            self.assertEqual(str(self.app.btn_stop.cget("state")), "disabled")
+        finally:
+            self.app.stop_requested = previous_stop
+            self.app._set_busy(False)
+
+    def test_open_saved_reading_replaces_live_content_and_opens_browser(self):
+        from types import SimpleNamespace
+        saved = SimpleNamespace(identity="saved-book", title="书名")
+        self.app.reading_chapters[("旧书", 9)] = ("旧章节", [], [])
+        with patch("gui.filedialog.askopenfilename", return_value="finished.epub"), \
+                patch("saved_reading.SavedReading", return_value=saved), \
+                patch.object(self.app, "_open_web_reader") as open_reader:
+            self.app._open_saved_reading()
+            deadline = time.monotonic() + 3
+            while self.app.saved_reading_loading and time.monotonic() < deadline:
+                self.app.update()
+                time.sleep(.01)
+            open_reader.assert_called_once()
+        self.assertEqual(self.app.reading_book, "saved-book")
+        self.assertEqual(self.app.reading_chapters, {})
+        self.assertIs(self.app.web_reader_server.saved, saved)
+        self.app.web_reader_server.reset("")
+
     @classmethod
     def setUpClass(cls):
         try:
@@ -107,7 +249,7 @@ class GuiStateTests(unittest.TestCase):
         self.assertGreater(panel.winfo_height(), 50)
         self.assertLessEqual(panel.winfo_rooty() + panel.winfo_height(),
                              self.app.winfo_rooty() + self.app.winfo_height())
-        for widget in (self.app.btn_start_tr, self.app.tr_model_box,
+        for widget in (self.app.btn_start_tr, self.app.btn_full_tr, self.app.tr_model_box,
                        self.app.tr_bilingual_check):
             self.assertTrue(widget.winfo_viewable())
             self.assertGreater(widget.winfo_height(), 20)

@@ -87,6 +87,7 @@ from epub_append import build_extended_epub, create_project_from_epub, inspect_e
 from languages import LANGUAGES, language_name
 from gui_settings import SettingsDialog
 from gui_task_state import TaskStateMixin
+from gui_workflow import WorkflowMixin
 from app_config import update_config
 from main import (translate_epub_language, load_review_project, MissingProjectSource,
                   audit_project, project_glossary, retranslate_project)
@@ -205,7 +206,7 @@ class PageHost(ttk.Frame):
         self.event_generate("<<NotebookTabChanged>>")
 
 
-class TranslatorGUI(TaskStateMixin, tk.Tk):
+class TranslatorGUI(WorkflowMixin, TaskStateMixin, tk.Tk):
     _dialogs = messagebox
 
     def __init__(self):
@@ -497,6 +498,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self._setup_tab_translate()
         self._setup_tab_audit()
         self._add_page_actions()
+        self._setup_network_controls()
         for variable in (self.tr_epub_var, self.proj_dir_var, self.audit_proj_var, self.import_title_var):
             variable.trace_add("write", lambda *_: self._update_current_work())
 
@@ -568,6 +570,9 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         web_button = ttk.Button(translate_actions, text="网页 / 手机阅读", command=self._open_web_reader)
         web_button.pack(side=tk.LEFT, padx=(0, 8))
         self.navigation_buttons.append(web_button)
+        saved_button = ttk.Button(translate_actions, text="打开已完成小说", command=self._open_saved_reading)
+        saved_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.navigation_buttons.append(saved_button)
         glossary_actions = ttk.Frame(self.tab_glossary)
         glossary_actions.pack(fill=tk.X, pady=(0, 12), before=self.tab_glossary.winfo_children()[0])
         nav_button(glossary_actions, "← 返回翻译", "translate")
@@ -590,6 +595,42 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             self.web_reader_server.update(payload)
         if self.reader_window is not None and self.reader_window.winfo_exists():
             self.reader_window.refresh()
+
+    def _open_saved_reading(self):
+        from saved_reading import SavedReading
+        if getattr(self, "saved_reading_loading", False) or (self.active_thread is not None and self.active_thread.is_alive()):
+            messagebox.showinfo("任务正在运行", "请等待当前任务结束后再打开已完成小说。")
+            return
+        selected = filedialog.askopenfilename(
+            title="打开已完成小说",
+            filetypes=[("译文 EPUB 或项目", "*.epub *.json"), ("EPUB", "*.epub"), ("项目 JSON", "*.json")])
+        if not selected:
+            return
+        self.saved_reading_loading = True
+        self.status_var.set("正在后台加载小说目录……")
+        def worker():
+            try:
+                self.log_queue.put(("saved_reading_ready", SavedReading(selected)))
+            except Exception as exc:
+                self.log_queue.put(("saved_reading_error", str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _saved_reading_ready(self, saved):
+        from web_reader import ReadingServer
+        self.saved_reading_loading = False
+        if self.active_thread is not None and self.active_thread.is_alive():
+            return
+        self.reading_book = saved.identity
+        self.reading_chapters.clear()
+        try:
+            if self.web_reader_server is None:
+                self.web_reader_server = ReadingServer()
+            self.web_reader_server.open_saved(saved)
+        except OSError as exc:
+            messagebox.showerror("网页阅读启动失败", str(exc))
+            return
+        self.status_var.set(f"已打开：{saved.title} · 正文按章加载")
+        self._open_web_reader()
 
     def _open_web_reader(self):
         import webbrowser
@@ -721,6 +762,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
 
         # Work info display
         info_frame = ttk.LabelFrame(f, text="章节范围", padding=10)
+        self.dl_info_frame = info_frame
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         self.dl_info_lbl = ttk.Label(info_frame, text="输入网址后读取目录。", wraplength=800)
@@ -749,7 +791,8 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
 
         # Download button
         btn_box = ttk.Frame(f)
-        btn_box.pack(fill=tk.X, pady=4)
+        # Reserve the action row before the expanding chapter list consumes space.
+        btn_box.pack(side=tk.BOTTOM, fill=tk.X, pady=4, before=info_frame)
 
         self.btn_start_dl = ttk.Button(btn_box, text="下載 EPUB", style="Accent.TButton", command=self._action_start_download)
         self.btn_start_dl.pack(side=tk.RIGHT, padx=4)
@@ -831,7 +874,8 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             return
 
         work = self.current_work
-        self._set_busy(True, f"正在下載《{work.title}》第 {start} 至 {end} 章……")
+        self.stop_requested = False
+        self._set_busy(True, f"正在下載《{work.title}》第 {start} 至 {end} 章……", cancellable=True)
 
         def _worker():
             try:
@@ -1837,6 +1881,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             state="readonly",
         )
         self.tr_model_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._setup_workflow_controls(opt_frame)
 
         self.tr_progress_frame = ttk.LabelFrame(f, text="翻译进度", padding=6)
         self.tr_progress_frame.pack(side=tk.BOTTOM, fill=tk.X,
@@ -1844,9 +1889,12 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         progress_row = ttk.Frame(self.tr_progress_frame)
         progress_row.pack(fill=tk.X)
         self.btn_start_tr = ttk.Button(
-            progress_row, text="开始翻译", style="Accent.TButton",
+            progress_row, text="一键试译", style="Accent.TButton",
             command=self._action_start_translate)
         self.btn_start_tr.pack(side=tk.RIGHT, padx=(12, 0))
+        self.btn_full_tr = ttk.Button(progress_row, text="确认后翻译全部", state=tk.DISABLED,
+                                      command=lambda: self._action_start_translate(preview=False))
+        self.btn_full_tr.pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Label(progress_row, text="总进度").pack(side=tk.LEFT)
         ttk.Label(progress_row, textvariable=self.progress_text_var).pack(side=tk.RIGHT)
         self.tr_bilingual_var = tk.BooleanVar(value=self.cfg.get("bilingual_output", False))
@@ -1876,7 +1924,13 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self.stop_requested = True
         self.status_var.set("正在中止操作……")
 
-    def _action_start_translate(self):
+    def _action_start_translate(self, *, preview=True):
+        if not preview:
+            self._sync_workflow()
+            online_url = getattr(self, "workflow_state", {}).get("network_url")
+            if online_url:
+                self._action_network_workflow(full=True, url=online_url)
+                return
         epub_str = self.tr_epub_var.get().strip()
         if not epub_str or not Path(epub_str).exists():
             messagebox.showwarning("提示", "請先選擇有效的日文 EPUB 檔案。")
@@ -1892,6 +1946,23 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
             messagebox.showwarning("提示", "请先从下拉框选择翻译模型。")
             return
         self.cfg["model"] = model
+        try:
+            preview_count = int(self.tr_preview_count.get().strip())
+            if preview_count < 1:
+                raise ValueError()
+        except ValueError:
+            messagebox.showwarning("试译范围错误", "试译章节数必须是大于零的整数。")
+            return
+        if not preview:
+            from translation_workflow import ready_for_full
+            self._sync_workflow()
+            if not ready_for_full(self.workflow_state, source, languages):
+                messagebox.showwarning("请先试译", "请先完成当前小说和所选语言的试译。")
+                return
+        if getattr(self, "task_busy", False):
+            return
+        self.workflow_running = True
+        self.workflow_status.set("正在翻译全部并检查……" if not preview else f"正在试译前 {preview_count} 章，完成后将等待确认……")
 
         task_cfg = dict(self.cfg)
         task_cfg["_translation_cancelled"] = lambda: self.stop_requested
@@ -1906,45 +1977,23 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         task_cfg["_reading_update"] = lambda *payload: self.log_queue.put(("reading", payload))
         task_cfg["_translation_activity"] = lambda message: self.log_queue.put(("status", message))
         self.stop_requested = False
-        self._set_busy(True, f"正在開始翻譯《{source.stem}》……")
-        self.btn_stop.config(state=tk.NORMAL)
+        self._set_busy(True, f"正在開始翻譯《{source.stem}》……", cancellable=True)
 
         def _worker():
-            outputs = []
-            failures = []
+            from translation_workflow import run_workflow
             try:
                 ensure_model(task_cfg, interactive=False)
-                for language_index, code in enumerate(languages):
-                    if self.stop_requested:
-                        raise TranslationCancelled()
-
-                    def progress(percent, message):
-                        overall = (language_index * 100 + percent) / len(languages)
-                        self.log_queue.put(("progress", overall))
-                        self.log_queue.put(("status", message))
-
-                    try:
-                        output = translate_epub_language(source, task_cfg, code, progress)
-                        outputs.append(str(output))
-                        self.log_queue.put(("log", f"[{language_name(code)}] 已完成：{output}\n"))
-                    except TranslationCancelled:
-                        raise
-                    except Exception as exc:
-                        failures.append(f"{language_name(code)}：{exc}")
-                        self.log_queue.put(("log", f"[{language_name(code)}] 未完成：{exc}\n"))
-                if failures:
-                    summary = "\n".join(failures)
-                    if outputs:
-                        summary += "\n\n已成功輸出：\n" + "\n".join(outputs)
-                    self.log_queue.put(("error", summary))
-                else:
-                    self.log_queue.put(("progress", 100.0))
-                    self.log_queue.put(("translate_complete", "\n".join(outputs)))
+                def progress(percent, message):
+                    self.log_queue.put(("progress", percent))
+                    self.log_queue.put(("status", message))
+                state = run_workflow(source, task_cfg, languages, preview_count,
+                                     full=not preview, progress=progress)
+                self.log_queue.put(("progress", 100.0))
+                self.log_queue.put(("workflow_complete", state))
             except TranslationCancelled:
-                self.log_queue.put(("log", "已停止翻譯，保留各語言已完成的進度，可重新開始接續。\n"))
                 self.log_queue.put(("translate_stopped", None))
             except Exception as exc:
-                self.log_queue.put(("error", f"翻譯失敗：{exc}"))
+                self.log_queue.put(("error", str(exc)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2109,8 +2158,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self.stop_requested = False
         task_cfg = dict(self.cfg)
         task_cfg["_translation_cancelled"] = lambda: self.stop_requested
-        self._set_busy(True, "正在重译选中段落……")
-        self.btn_stop.config(state=tk.NORMAL)
+        self._set_busy(True, "正在重译选中段落……", cancellable=True)
         location = (chapter, violation.paragraph_index, violation.original_text)
 
         def progress(percent, title):
@@ -2221,8 +2269,7 @@ class TranslatorGUI(TaskStateMixin, tk.Tk):
         self.stop_requested = False
         task_cfg = dict(self.cfg)
         task_cfg["_translation_cancelled"] = lambda: self.stop_requested
-        self._set_busy(True, "正在局部重译……")
-        self.btn_stop.config(state=tk.NORMAL)
+        self._set_busy(True, "正在局部重译……", cancellable=True)
 
         def progress(percent, title):
             self.log_queue.put(("progress", percent))
