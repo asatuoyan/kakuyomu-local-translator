@@ -23,6 +23,20 @@ class FakeResponse:
 
 class OllamaChatContentTests(unittest.TestCase):
     @patch("main.requests.post")
+    def test_http_error_preserves_ollama_context_details_and_closes_response(self, post):
+        import requests
+        from unittest.mock import Mock
+        response = requests.Response()
+        response.status_code = 400
+        response._content = b'{"error":"request (4527 tokens) exceeds the available context size (4096 tokens)"}'
+        response.close = Mock()
+        post.return_value = response
+        with self.assertRaisesRegex(requests.HTTPError, "4527 tokens") as raised:
+            main._read_ollama_content({"model": "test"}, self.cfg)
+        self.assertIs(raised.exception.response, response)
+        response.close.assert_called_once()
+
+    @patch("main.requests.post")
     def test_runaway_translation_stream_stops_and_closes_response(self, post):
         import json
         response = FakeResponse([

@@ -19,7 +19,7 @@ TRANSLATION_MODELS = {
 }
 DEFAULT_MODEL = TRANSLATION_MODELS["Hy-MT2 7B Q4_K_M"]
 
-_POSITIVE_INTS = ("translation_chunk_chars", "translation_chunk_paragraphs", "hy_mt_num_ctx")
+_POSITIVE_INTS = ("translation_chunk_chars", "translation_chunk_paragraphs", "hy_mt_num_ctx", "glossary_num_ctx")
 _NONNEGATIVE_INTS = ("translation_max_retries", "context_chars", "hy_mt_context_chars")
 _POSITIVE_NUMBERS = ("request_timeout_seconds",)
 _NONNEGATIVE_NUMBERS = ("translation_retry_delay_seconds", "request_delay_seconds", "temperature")

@@ -9,6 +9,31 @@ from glossary_manager import GlossaryEntry, load_project_glossary, save_project_
 
 
 class FirstTermsTests(unittest.TestCase):
+    def test_context_is_explicit_and_long_paragraphs_are_bounded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = {"model": "test", "hy_mt_num_ctx": 8192}
+            original, translation = "あ" * 7000, "字" * 8000
+            with patch("main.ollama_chat_content", return_value='{"entries": []}') as chat:
+                capture_terms([original], [translation], cfg, folder)
+            self.assertGreater(chat.call_count, 1)
+            source_pieces, target_pieces = [], []
+            for call in chat.call_args_list:
+                payload = call.args[0]
+                self.assertEqual(payload["options"]["num_ctx"], 8192)
+                self.assertEqual(payload["options"]["num_predict"], 1024)
+                pairs = json.loads(payload["messages"][1]["content"])
+                self.assertLessEqual(sum(len(p["source"]) + len(p["translation"]) for p in pairs), 2528)
+                source_pieces.extend(p["source"] for p in pairs)
+                target_pieces.extend(p["translation"] for p in pairs)
+            self.assertGreaterEqual(sum(map(len, source_pieces)), len(original))
+            self.assertGreaterEqual(sum(map(len, target_pieces)), len(translation))
+
+    def test_glossary_context_can_be_configured_independently(self):
+        with tempfile.TemporaryDirectory() as folder, patch("main.ollama_chat_content", return_value='{"entries": []}') as chat:
+            capture_terms(["レオン"], ["里昂"], {"model": "test", "hy_mt_num_ctx": 8192,
+                                                   "glossary_num_ctx": 4096}, folder)
+            self.assertEqual(chat.call_args.args[0]["options"]["num_ctx"], 4096)
+
     def test_next_chapter_uses_first_saved_name(self):
         import main
         from source_epub import SourceChapter

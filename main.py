@@ -366,7 +366,16 @@ def _read_ollama_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
         timeout=cfg.get("request_timeout_seconds", 600),
     )
     try:
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            try:
+                details = response.json().get("error", response.text)
+            except (ValueError, AttributeError):
+                details = response.text
+            raise requests.HTTPError(
+                f"Ollama 请求失败（HTTP {response.status_code}，模型 {payload.get('model', '')}）：{str(details)[:2000]}",
+                response=response, request=exc.request) from exc
         content_parts: list[str] = []
         generated = 0
         thinking = 0

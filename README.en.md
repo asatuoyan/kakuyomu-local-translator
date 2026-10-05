@@ -54,6 +54,8 @@ After each chapter is saved, `glossary_model` extracts proper names from aligned
 
 Capture operates at chapter boundaries; different spellings can still occur within the same chapter. AI extraction may omit or misidentify terms. Invalid extraction output stops the task while retaining saved chapters; restarting retries extraction and continues translation.
 
+Glossary extraction explicitly sets the request context using `glossary_num_ctx` (default: 8192), independently of translation's `hy_mt_num_ctx`. It reserves room for instructions and JSON output, splits larger inputs into batches, and processes very long paragraphs through overlapping windows. Increasing context requires more RAM/VRAM and must stay within the model's supported capacity. HTTP errors include Ollama's actual error message, such as input tokens exceeding the available context.
+
 On **术语** (Glossary), select a work, edit target names, and click **保存修改** (Save changes). **导出 JSON** (Export JSON) and **导入 JSON** (Import JSON) let you send names to another AI for consolidation and import the result. Keep `source` and `target` fields intact:
 
 ```json

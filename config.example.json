@@ -20,6 +20,7 @@
   "hy_mt_num_ctx": 4096,
   "hy_mt_prefer_whole_chapter": true,
   "glossary_model": "",
+  "glossary_num_ctx": 8192,
   "request_timeout_seconds": 600,
   "request_delay_seconds": 8.0,
   "temperature": 0.2,
