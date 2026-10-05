@@ -1540,6 +1540,8 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     def translate(ep, label, reading=None):
         nonlocal completed_units
         check_cancelled()
+        if cfg.get("_task_stage"):
+            cfg["_task_stage"]("translation", label)
         def episode_progress(done, total):
             if progress:
                 if streaming:
@@ -1599,8 +1601,12 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
             from first_translation_terms import capture_terms
             record = book.state["chapters"][index - 1]
             report(f"{label} · 保存首次译名")
+            if cfg.get("_task_stage"):
+                cfg["_task_stage"]("glossary", f"{label} · 正在整理术语")
             additions = capture_terms(chapter.paragraphs, record["paragraphs"], chapter_cfg, work_dir)
             chapter_cfg["glossary"].update(entries_to_dict(additions))
+            if cfg.get("_task_stage"):
+                cfg["_task_stage"]("glossary", f"{label} · 已完成（新增 {len(additions)} 条）")
         completed_chapters = index
         if cfg.get("_chapter_completed"):
             cfg["_chapter_completed"](index)
@@ -1627,6 +1633,9 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
         save_translation_state(book.path, book.state)
     if progress:
         progress(100.0, f"{language} · 已完成")
+    if chapter_limit is None:
+        book.state["output_path"] = str(output.resolve())
+        save_translation_state(book.path, book.state)
     return output
 
 

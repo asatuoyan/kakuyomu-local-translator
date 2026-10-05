@@ -74,6 +74,37 @@ class WebAppTests(unittest.TestCase):
         self.app.project_ready(self.project)
         self.assertEqual(self.app.status()["task"]["project"], "book")
 
+    def test_restart_restores_project_download_resume_and_examples(self):
+        source = Path(self.tmp.name) / "network-workflows" / "123" / "source_123.epub"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"original")
+        output = self.project / "translated.epub"
+        output.write_bytes(b"translated")
+        atomic_json(source.parent / "network.json", {"source": str(source), "url": "https://kakuyomu.jp/works/123"})
+        atomic_json(self.project / "translation-project.json", {"metadata": {"title": "book"}, "language": "en",
+            "source_path": str(source), "output_path": str(output), "chapters": [
+                {"title": "one", "source_paragraphs": ["レオンです"], "paragraphs": ["This is Leon"]}]})
+        projects = self.app.projects()
+        self.assertEqual(projects[0]["download"], str(output.relative_to(Path(self.tmp.name))))
+        with patch.object(self.app, "start") as start:
+            self.post("resume", {"project": "book", "model": "chosen"})
+        self.assertEqual(start.call_args.args[0]["url"], "https://kakuyomu.jp/works/123")
+        self.assertEqual(start.call_args.args[0]["model"], "chosen")
+        self.assertEqual(self.app.term_examples(self.project, "レオン")["examples"][0]["translation"], "This is Leon")
+
+    def test_terms_revision_and_stage_messages_are_independent(self):
+        self.app.stage("translation", "translating")
+        self.app.stage("acquisition", "fetching")
+        self.app.stage("glossary", "extracting")
+        self.app.model_activity("model generated")
+        self.assertEqual(self.app.task["stages"], {"translation": "translating", "acquisition": "fetching", "glossary": "model generated"})
+        self.app.write_terms({"project": "book", "entries": [{"source": "レオン", "target": "里昂"}]})
+        revision = self.app.term_revision(self.project)
+        with urlopen(self.server.url + "api/terms?project=book&revision=" + revision) as response:
+            self.assertTrue(json.load(response)["unchanged"])
+        self.app.write_terms({"project": "book", "entries": [{"source": "レオン", "target": "莱昂"}]})
+        self.assertNotEqual(self.app.term_revision(self.project), revision)
+
     def test_ollama_failure_and_missing_model_are_reported_without_starting(self):
         with patch("main.installed_models", side_effect=RuntimeError("Ollama unavailable")):
             with self.assertRaises(HTTPError) as raised:

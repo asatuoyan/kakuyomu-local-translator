@@ -9,6 +9,25 @@ from glossary_manager import GlossaryEntry, load_project_glossary, save_project_
 
 
 class FirstTermsTests(unittest.TestCase):
+    def test_successful_and_empty_extraction_are_skipped_on_resume(self):
+        with tempfile.TemporaryDirectory() as folder, patch("main.ollama_chat_content", return_value='{"entries": []}') as chat:
+            cfg = {"model": "test"}
+            capture_terms(["レオン"], ["里昂"], cfg, folder)
+            capture_terms(["レオン"], ["里昂"], cfg, folder)
+            self.assertEqual(chat.call_count, 1)
+            capture_terms(["レオン"], ["莱昂"], cfg, folder)
+            self.assertEqual(chat.call_count, 2)
+            capture_terms(["レオン"], ["莱昂"], {"model": "other"}, folder)
+            self.assertEqual(chat.call_count, 3)
+
+    def test_failure_does_not_mark_extraction_complete(self):
+        with tempfile.TemporaryDirectory() as folder, patch("main.ollama_chat_content", side_effect=['invalid', '{"entries": []}']) as chat:
+            with self.assertRaises(ValueError):
+                capture_terms(["レオン"], ["里昂"], {"model": "test"}, folder)
+            self.assertFalse((Path(folder) / "glossary-extraction.json").exists())
+            capture_terms(["レオン"], ["里昂"], {"model": "test"}, folder)
+            self.assertEqual(chat.call_count, 2)
+
     def test_context_is_explicit_and_long_paragraphs_are_bounded(self):
         with tempfile.TemporaryDirectory() as folder:
             cfg = {"model": "test", "hy_mt_num_ctx": 8192}

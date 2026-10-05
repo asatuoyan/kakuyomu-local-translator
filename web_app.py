@@ -2,6 +2,7 @@
 import argparse
 from dataclasses import asdict
 import json
+import hashlib
 from pathlib import Path
 import secrets
 import threading
@@ -28,15 +29,40 @@ class Application:
         from main import project_exists
         result = []
         root = Path(self.cfg["output_dir"])
+        network_sources = {}
+        for network_file in (root / "network-workflows").glob("*/network.json"):
+            try:
+                saved = load_json(network_file, {})
+                if saved.get("source") and saved.get("url"):
+                    network_sources[Path(saved["source"]).stem] = saved["url"]
+            except (OSError, ValueError):
+                continue
         for path in sorted(root.rglob("translation-project.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True):
             folder = path.parent
             if project_exists(folder):
                 try:
                     project = load_json(path, {})
+                    source = project.get("source_path", "")
+                    url = network_sources.get(Path(source).stem, "") if source else ""
+                    output = project.get("output_path", "")
+                    if not output:
+                        from main import safe_name
+                        from languages import language_suffix
+                        if project.get("language"):
+                            base = safe_name(project.get("metadata", {}).get("title", folder.name)) + "_" + language_suffix(project["language"])
+                            output = next((str(folder / (base + suffix + ".epub")) for suffix in ("", "_双语对照") if (folder / (base + suffix + ".epub")).is_file()), "")
+                    download = ""
+                    if output:
+                        candidate = Path(output).resolve()
+                        if candidate.is_relative_to(root.resolve()) and candidate.is_file():
+                            download = str(candidate.relative_to(root.resolve()))
                     result.append({"id": str(folder.relative_to(root)),
                                    "title": project.get("metadata", {}).get("title", folder.name),
                                    "language": project.get("language", ""),
                                    "term_count": len(load_project_glossary(folder)),
+                                   "resume": {"url": url, "source": "" if url else source,
+                                              "language": project.get("language", "zh-Hans")} if url or (source and Path(source).is_file()) else None,
+                                   "download": download,
                                    "chapters": project.get("chapter_count", len(project.get("chapters", [])))})
                 except (OSError, ValueError, KeyError):
                     continue
@@ -112,6 +138,8 @@ class Application:
             self.cfg["model"] = model
             self.cancel.clear()
             self.task = {"running": True, "percent": 0, "message": "正在启动…", "output": "",
+                         "stages": {"acquisition": "等待获取" if url else "本地 EPUB，无需获取",
+                                    "translation": "等待原文", "glossary": "等待译文"},
                          "url": url, "source": source, "language": language}
             history = load_json(self.history_path, [])
             item = {"url": url, "source": source, "language": language}
@@ -119,7 +147,7 @@ class Application:
             atomic_json(self.history_path, [item] + [x for x in history if (x.get("url") or x.get("source")) != identity][:19])
             cfg = dict(self.cfg)
         cfg.update(_translation_cancelled=self.cancel.is_set, _capture_first_terms=True,
-                   _translation_activity=lambda msg: self.progress(None, msg),
+                   _translation_activity=self.model_activity, _task_stage=self.stage,
                    _translation_project_ready=self.project_ready)
         def worker():
             from main import translate_epub_language, translation_work_dir, TranslationCancelled
@@ -136,6 +164,8 @@ class Application:
                 with self.lock:
                     self.task.update(percent=100, message="翻译完成", output=str(output),
                                      project=str(work_dir.relative_to(Path(cfg["output_dir"]))))
+                    self.task["stages"].update(acquisition="获取完成" if url else "本地 EPUB，无需获取",
+                                              translation="翻译完成", glossary="术语整理完成")
             except TranslationCancelled:
                 self.progress(None, "已停止，已保存章节可续译")
             except Exception as exc:
@@ -150,6 +180,39 @@ class Application:
             self.task["message"] = message
             if percent is not None:
                 self.task["percent"] = round(percent, 1)
+
+    def stage(self, name, message):
+        with self.lock:
+            self.task.setdefault("stages", {})[name] = message
+            if name in ("translation", "glossary"):
+                self._model_stage = name
+
+    def model_activity(self, message):
+        self.stage(getattr(self, "_model_stage", "translation"), message)
+
+    def term_revision(self, path):
+        glossary = path / "glossary.json"
+        return hashlib.sha256(glossary.read_bytes() if glossary.exists() else b"").hexdigest()
+
+    def term_examples(self, path, source):
+        if not source or len(source) > 500:
+            raise ValueError("请提供有效术语")
+        manifest = load_json(path / "translation-project.json", {})
+        if manifest.get("schema_version") == 2:
+            chapters = (load_json(path / "chapters" / f"{index:06d}.json", {})
+                        for index in range(1, manifest.get("chapter_count", 0) + 1))
+        else:
+            chapters = iter(manifest.get("chapters", []))
+        examples = []
+        for index, chapter in enumerate(chapters, 1):
+            for original, translation in zip(chapter.get("source_paragraphs", chapter.get("japanese", [])),
+                                             chapter.get("paragraphs", chapter.get("translation", []))):
+                if source in original:
+                    examples.append({"chapter": chapter.get("title", str(index)), "original": original,
+                                     "translation": translation})
+                    if len(examples) >= 2:
+                        return {"examples": examples}
+        return {"examples": examples}
 
     def pipeline_counts(self, counts):
         with self.lock:
@@ -206,14 +269,22 @@ def create_server(app, port=0):
             try:
                 if route == "/":
                     self.send(Path(__file__).with_name("web_app.html").read_bytes(), "text/html; charset=utf-8")
+                elif route == "/app.js":
+                    self.send(Path(__file__).with_name("web_app.js").read_bytes(), "text/javascript; charset=utf-8")
                 elif route == "/api/status":
                     self.send(app.status())
                 elif route == "/api/models":
                     self.send(app.models())
                 elif route in ("/api/terms", "/api/export"):
                     path = app.project(query.get("project", [""])[0])
-                    result = {"entries": [asdict(e) for e in load_project_glossary(path)]}
+                    revision = app.term_revision(path)
+                    result = ({"unchanged": True, "revision": revision}
+                              if route == "/api/terms" and query.get("revision", [""])[0] == revision else
+                              {"entries": [asdict(e) for e in load_project_glossary(path)], "revision": revision})
                     self.send(result, attachment="glossary.json" if route.endswith("export") else None)
+                elif route == "/api/examples":
+                    self.send(app.term_examples(app.project(query.get("project", [""])[0]),
+                                                query.get("source", [""])[0]))
                 elif route == "/api/download":
                     root = Path(app.cfg["output_dir"]).resolve()
                     path = (root / query.get("file", [""])[0]).resolve()
@@ -243,6 +314,12 @@ def create_server(app, port=0):
                 elif route.endswith("/stop"):
                     app.cancel.set()
                     result = {"stopping": True}
+                elif route.endswith("/resume"):
+                    project = next((p for p in app.projects() if p["id"] == body.get("project")), None)
+                    if not project or not project["resume"]:
+                        raise ValueError("无法定位原文，请重新选择原文 EPUB 或小说网址")
+                    app.start({**project["resume"], "model": body.get("model", app.cfg["model"])})
+                    result = {"started": True}
                 elif route.endswith("/terms"):
                     result = app.write_terms(body)
                 elif route.endswith("/read"):

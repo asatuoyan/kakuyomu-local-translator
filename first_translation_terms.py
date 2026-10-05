@@ -1,6 +1,9 @@
 """Capture names from aligned translations without inventing new translations."""
 import json
 import math
+import hashlib
+from pathlib import Path
+from project_storage import atomic_json, load_json
 
 from glossary_manager import GlossaryEntry, load_project_glossary, merge_glossaries, save_project_glossary
 
@@ -8,6 +11,14 @@ from glossary_manager import GlossaryEntry, load_project_glossary, merge_glossar
 def capture_terms(originals, translations, cfg, work_dir):
     from main import ollama_chat_content, check_translation_cancelled
     pairs = list(zip(originals, translations))
+    checkpoint_path = Path(work_dir) / "glossary-extraction.json"
+    checkpoint = load_json(checkpoint_path, {})
+    identity = hashlib.sha256(json.dumps({"pairs": pairs, "model": cfg.get("glossary_model") or cfg["model"],
+                                         "version": 1}, ensure_ascii=False).encode()).hexdigest()
+    if identity in checkpoint:
+        if cfg.get("_task_stage"):
+            cfg["_task_stage"]("glossary", "已完成，复用术语提取记录")
+        return []
     existing = load_project_glossary(work_dir)
     known = set(cfg.get("glossary", {})) | {e.source for e in existing}
     incoming = []
@@ -60,4 +71,7 @@ def capture_terms(originals, translations, cfg, work_dir):
         check_translation_cancelled(cfg)
     if incoming:
         save_project_glossary(work_dir, merge_glossaries(existing, incoming, overwrite=False))
+    check_translation_cancelled(cfg)
+    checkpoint[identity] = {"terms": len(incoming)}
+    atomic_json(checkpoint_path, checkpoint)
     return incoming

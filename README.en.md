@@ -56,6 +56,12 @@ Capture operates at chapter boundaries; different spellings can still occur with
 
 Glossary extraction explicitly sets the request context using `glossary_num_ctx` (default: 8192), independently of translation's `hy_mt_num_ctx`. It reserves room for instructions and JSON output, splits larger inputs into batches, and processes very long paragraphs through overlapping windows. Increasing context requires more RAM/VRAM and must stay within the model's supported capacity. HTTP errors include Ollama's actual error message, such as input tokens exceeding the available context.
 
+Successful extraction, including an empty result, creates a checkpoint in the project's `glossary-extraction.json`. Resuming skips extraction when the original text, translation, and extraction model match. Failed extraction does not create a completed checkpoint. Older projects without checkpoints are scanned once; changed text or a different extraction model triggers a new scan. Editing or importing glossary entries does not automatically rescan chapters.
+
+The progress area displays separate acquisition, translation, and glossary messages, with model generation information in the corresponding stage. **我的作品** (My books) provides **继续翻译** (Continue translation), using the project's source and language with the currently selected model. A saved complete EPUB has a download link that remains available after restarting the application. Older projects with missing sources and no recoverable website URL require you to select the source again.
+
+Search glossary entries by original term, target, or category. **例句** (Examples) shows up to two saved original/translated paragraph pairs for a term. Projects without originals explicitly report that examples are unavailable. The page still polls progress, but only rebuilds book, recent-task, and glossary lists when their data changes; unsaved glossary edits are preserved.
+
 On **术语** (Glossary), select a work, edit target names, and click **保存修改** (Save changes). **导出 JSON** (Export JSON) and **导入 JSON** (Import JSON) let you send names to another AI for consolidation and import the result. Keep `source` and `target` fields intact:
 
 ```json

@@ -23,6 +23,8 @@ def run_streaming_workflow(url, cfg, language, progress=None, counts=None):
 
     def report(kind, percent, message):
         with lock:
+            if cfg.get("_task_stage"):
+                cfg["_task_stage"]("acquisition" if kind == "acquisition" else "translation", message)
             if counts:
                 counts(dict(tally))
             if progress:
@@ -85,8 +87,12 @@ def run_streaming_workflow(url, cfg, language, progress=None, counts=None):
             result.append(acquire_source(url, task_cfg, 1, full=True,
                 progress=lambda p, m: report("acquisition", p, m),
                 work_ready=ready, chapter_ready=chapter_ready))
+            if cfg.get("_task_stage"):
+                cfg["_task_stage"]("acquisition", "获取完成")
         except Exception as exc:
             failure.append(exc)
+            if cfg.get("_task_stage"):
+                cfg["_task_stage"]("acquisition", f"获取停止：{exc}")
         finally:
             if not stopped.is_set() and not cancelled():
                 try:
