@@ -28,7 +28,7 @@ class Application:
         from main import project_exists
         result = []
         root = Path(self.cfg["output_dir"])
-        for path in sorted(root.rglob("translation-project.json")):
+        for path in sorted(root.rglob("translation-project.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True):
             folder = path.parent
             if project_exists(folder):
                 try:
@@ -36,6 +36,7 @@ class Application:
                     result.append({"id": str(folder.relative_to(root)),
                                    "title": project.get("metadata", {}).get("title", folder.name),
                                    "language": project.get("language", ""),
+                                   "term_count": len(load_project_glossary(folder)),
                                    "chapters": project.get("chapter_count", len(project.get("chapters", [])))})
                 except (OSError, ValueError, KeyError):
                     continue
@@ -95,7 +96,8 @@ class Application:
             atomic_json(self.history_path, [item] + [x for x in history if x != item][:19])
             cfg = dict(self.cfg)
         cfg.update(_translation_cancelled=self.cancel.is_set, _capture_first_terms=True,
-                   _translation_activity=lambda msg: self.progress(None, msg))
+                   _translation_activity=lambda msg: self.progress(None, msg),
+                   _translation_project_ready=self.project_ready)
         def worker():
             from main import translate_epub_language, translation_work_dir, TranslationCancelled
             try:
@@ -129,6 +131,10 @@ class Application:
     def pipeline_counts(self, counts):
         with self.lock:
             self.task["counts"] = counts
+
+    def project_ready(self, path):
+        with self.lock:
+            self.task["project"] = str(path.relative_to(Path(self.cfg["output_dir"])))
 
     def write_terms(self, body):
         with self.lock:

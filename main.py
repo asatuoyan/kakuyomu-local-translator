@@ -1459,6 +1459,8 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
     normalize_output("", language)  # Check the converter before doing model work.
     work_dir = translation_work_dir(source, cfg, language)
     work_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.get("_translation_project_ready"):
+        cfg["_translation_project_ready"](work_dir)
     if cfg.get("_stream_metadata") is not None:
         metadata, chapters = dict(cfg["_stream_metadata"]), cfg["_stream_prefix"]
     else:

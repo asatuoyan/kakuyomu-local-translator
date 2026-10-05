@@ -68,6 +68,12 @@ class WebAppTests(unittest.TestCase):
         with patch("main.installed_models", return_value=set()):
             self.assertEqual(self.app.models()["selected"], "")
 
+    def test_projects_show_term_counts_and_active_project_before_completion(self):
+        self.app.write_terms({"project": "book", "entries": [{"source": "レオン", "target": "里昂"}]})
+        self.assertEqual(self.app.projects()[0]["term_count"], 1)
+        self.app.project_ready(self.project)
+        self.assertEqual(self.app.status()["task"]["project"], "book")
+
     def test_ollama_failure_and_missing_model_are_reported_without_starting(self):
         with patch("main.installed_models", side_effect=RuntimeError("Ollama unavailable")):
             with self.assertRaises(HTTPError) as raised:
