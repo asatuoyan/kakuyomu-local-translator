@@ -1,0 +1,1 @@
+"""Formats application components."""

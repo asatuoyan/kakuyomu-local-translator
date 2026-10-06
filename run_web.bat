@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_environment.ps1" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_environment.ps1" %*
 if errorlevel 1 goto :error
 ".venv\Scripts\python.exe" -X utf8 web_app.py
 if errorlevel 1 goto :error
