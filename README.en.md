@@ -33,14 +33,34 @@ The interfaces currently use Simplified Chinese labels. This English manual expl
 
 ## Local Web interface
 
-There are three pages: **获取并翻译** (Acquire and translate) for task settings and progress, **我的作品** (My books) for finding, reading, and resuming saved projects, and **术语** (Glossary) for managing translations of terms. Use the top navigation to switch pages without interrupting a task. On completion, download, reading, and My books actions appear without automatically switching pages.
+After installing update support, manually restart `web_app.py` once. The Web interface then checks local Web assets and Python application files approximately every three seconds. Frontend changes offer a refresh without interrupting tasks. Backend changes offer restart now when idle, wait until tasks finish, or stop/save and then restart. Restart waits for both acquisition and model tasks to exit, validates syntax and primary imports, and keeps the existing service if validation fails. New jobs are blocked while waiting; pending restart can be cancelled; cancelling does not restart stopped jobs in the current service. Unfinished acquisition and translation resume when the service restarts.
+
+Restart keeps the current launch's URL and reconnects the page, restoring input values, the selected page, and book search. Projects and resume caches remain available. Reading windows must be reopened from Novel library after a backend restart. Unsaved glossary edits prevent automatic refresh. This detects local file changes and does not download releases or update dependencies. Launch through `web_app.py` or `python -m translator.ui.web_app` for supervised restart; embedded `create_server()` users receive update notices and manage their own lifecycle.
+
+Web acquisition and translation save their source, language, and model in `web-active-tasks.json` under the output directory. Unfinished jobs automatically continue from existing caches after an update, restart, or unexpected interruption. Browser acquisition waits for the shared browser to become free. Per-book pause transfers work to a persistent paused queue entry; other books may continue. Global pause retains active journals and resumes them before waiting entries. Failed recovery moves to a failed queue entry for explicit retry, without repeated automatic attempts or blocking later books. Selective retranslation requires a new review and manual start. Embedded services can call `app.restore_tasks()`.
+
+The acquisition and translation submit buttons always add tasks, including while another book runs. Per-book pause lives in the task panel, alongside a global pause/resume control. Selective retranslation still switches its own button to Stop while running and requires a fresh review before restarting.
+
+Novel library now includes both acquired originals and translation projects. Fully acquired original EPUBs can be downloaded before translation finishes. Untranslated originals offer a Start translation action; corresponding original and translated projects are displayed together with separate chapter counts. Completion filters use acquisition status for original-only books and translation status for translated projects.
+
+Enter another work URL and choose **只获取原文** (Acquire original only) to queue an independent download while the current translation continues. Once the current work's acquisition finishes, the shared browser is available for the next book; there is no need to wait for translation or glossary capture. Only one acquisition runs at a time. **暂停本书** pauses the independent download and leaves translation running; resume it from the paused list. Cached chapters and original-download entries remain available after restarting.
+
+On the **术语** (Glossary) page, select a book and click **检查译文** (Review translation) lists glossary compliance and conservative quality warnings with original/translated text, 50 paragraphs per page. Select paragraphs across pages and retranslate them using the model selected on the acquisition page. Other paragraphs and images remain intact; completion rebuilds EPUBs and reruns review. The task can be stopped, retaining completed chapters. Missing originals are reported separately; restore them with the desktop interface before review. Changed paragraphs or glossary entries require a fresh review before retranslation.
+
+After saving or importing glossary changes in the Web interface, **检查旧译名段落** finds paragraphs whose originals contain the term and whose translations still contain a previous target name. Review these candidates and selectively retranslate them. Previous names are recorded in each project's `glossary-changes.json` and survive restarts; tracking starts with changes made through this feature. Saving the glossary does not rewrite translated text.
+
+Web acquisition runs without a browser window. If authentication is required, it opens the application's dedicated browser for manual login. Once back on the work page, it saves the session, closes the visible window, and resumes acquisition in the background using the same profile. Existing sessions need no popup; this works regardless of the configured `headless` setting. Stop the task from the Web page to cancel waiting for login.
+
+Book manifests and glossary counts are cached until their files change. New tasks refresh discovery immediately; externally added projects appear within about ten seconds. No additional database is required. Generation progress retains the chapter name, phase, generated character count, and elapsed time.
+
+There are three pages: **获取并翻译** (Acquire and translate) for task settings and progress, **小说书库** (Novel library) for finding, reading, and resuming saved projects, and **术语** (Glossary) for managing translations of terms. Use the top navigation to switch pages without interrupting a task. On completion, download, reading, and Novel library actions appear without automatically switching pages.
 
 ### Acquire and translate
 
 1. Start `run_web.bat`; your default browser opens automatically.
 2. Enter a Kakuyomu or Syosetu work URL and select an installed translation model.
 3. Click **获取并翻译**. Translation starts after the first chapter is acquired, while the acquisition thread continues fetching later chapters. Translation follows the original chapter order. There is no separate preview or full-book confirmation step in the Web interface.
-4. Watch the independent acquired/translated chapter counts. Saved chapters appear under **我的作品** (My books), where **阅读** (Read) opens the reader. Once acquisition, translation, and glossary capture have all finished, download the complete EPUB.
+4. Watch the independent acquired/translated chapter counts. Saved chapters appear under **小说书库** (Novel library), where **阅读** (Read) opens the reader. Once acquisition, translation, and glossary capture have all finished, download the complete EPUB.
 
 Expand **本地 EPUB 与翻译设置** (Local EPUB and translation settings) to enter a local EPUB path or change the output language. A local file is translated directly.
 
@@ -60,11 +80,11 @@ Glossary extraction explicitly sets the request context using `glossary_num_ctx`
 
 Successful extraction, including an empty result, creates a checkpoint in the project's `glossary-extraction.json`. Resuming skips extraction when the original text, translation, and extraction model match. Failed extraction does not create a completed checkpoint. Older projects without checkpoints are scanned once; changed text or a different extraction model triggers a new scan. Editing or importing glossary entries does not automatically rescan chapters.
 
-The progress area displays separate acquisition, translation, and glossary messages, with model generation information in the corresponding stage. **我的作品** (My books) provides **继续翻译** (Continue translation), using the project's source and language with the currently selected model. A saved complete EPUB has a download link that remains available after restarting the application. Older projects with missing sources and no recoverable website URL require you to select the source again.
+The progress area displays separate acquisition, translation, and glossary messages, with model generation information in the corresponding stage. **小说书库** (Novel library) provides **继续翻译** (Continue translation), using the project's source and language with the currently selected model. A saved complete EPUB has a download link that remains available after restarting the application. Older projects with missing sources and no recoverable website URL require you to select the source again.
 
-**我的作品** (My books) lists projects by most recent update, with 10 books per page, title search, and All / Unfinished / Completed filters (All by default). Each entry shows its title, language, translated chapter count, and completion status, with reading, glossary, resume, and download actions; resume and download appear when the corresponding source or EPUB is available. Completed means the translated chapters cover the known total and the full EPUB exists without pending updates. Books are never automatically hidden or deleted.
+**小说书库** (Novel library) lists projects by most recent update, with 5 books per page, title search, and All / Unfinished / Completed filters (All by default). Each entry shows its title, language, translated chapter count, and completion status, with reading, resume, and download actions; resume and download appear when the corresponding source or EPUB is available. Completed means the translated chapters cover the known total and the full EPUB exists without pending updates. Books are never automatically hidden or deleted.
 
-Search glossary entries by original term, target, or category. **例句** (Examples) opens a dialog with up to two saved original/translated paragraph pairs and chapter titles, visible even when clicking near the bottom of the list. Close it with **关闭** (Close) or Esc. The dialog shows loading and request errors and distinguishes missing originals from a term absent in saved chapters. The page still polls progress, but only rebuilds book, recent-task, and glossary lists when their data changes; unsaved glossary edits are preserved.
+The glossary shows 20 entries per page. Search covers all entries by original term, target, or category. Pagination and search preserve unsaved edits, and saving merges edits from all pages. **例句** (Examples) opens a dialog with up to two saved original/translated paragraph pairs and chapter titles, visible even when clicking near the bottom of the list. Close it with **关闭** (Close) or Esc. The dialog shows loading and request errors and distinguishes missing originals from a term absent in saved chapters. The page still polls progress, but only rebuilds book, recent-task, and glossary lists when their data changes; unsaved glossary edits are preserved.
 
 On **术语** (Glossary), select a work, edit target names, and click **保存修改** (Save changes). **导出 JSON** (Export JSON) and **导入 JSON** (Import JSON) let you send names to another AI for consolidation and import the result. Keep `source` and `target` fields intact:
 
@@ -89,6 +109,8 @@ The application server listens only on the local computer. No deployment is need
 Open the full address printed in the terminal, including its generated path.
 
 ## Desktop GUI and CLI workflows
+
+CLI path selection uses native dialogs for EPUBs, glossary files, project folders, browser executables, text-import sources, and glossary export destinations. Temporary windows close after selection or cancellation. Cancellation ends the operation; console path input is used only when a dialog cannot open. An existing desktop GUI window is retained.
 
 The desktop GUI's top menu provides **获取小说** (Acquire novels), **翻译小说** (Translate novels), and **检查译文** (Check translations). Acquisition offers website downloads and local imports. The translation page links to glossary management. The selected title appears at the top; settings control the model, Ollama address, and theme. The log opens from the bottom status bar. New GUI tasks default to Simplified Chinese; existing `target_language` settings still apply to the CLI and related project workflows.
 
@@ -134,11 +156,11 @@ The EPUB importer supports paragraphs, containers, lists, quotations, headings, 
 
 Desktop **实时阅读** (Live reading) shows translated batches with optional original text; updating preserves the reading position. **网页 / 手机阅读** (Web / mobile reading) opens the browser reader and provides LAN addresses. Keep the computer running and connect your phone to the same Wi-Fi. If necessary, allow Python through the Windows private-network firewall.
 
-The reader checks for updates every two seconds and provides chapter navigation, original/translation comparison, font size, night mode, and browser-local reading positions. Its collapsible table of contents groups chapters by language and volume. Volume labels come from chapter-title markers such as 第 X 卷／巻／部; chapters without a marker appear as ungrouped. Previous/next controls appear below the text. The current reader displays text; use an EPUB reader for illustrations. Closing the program stops the reading service; a new launch generates a new address.
+Each saved book has its own reader address, so opening another book does not change existing windows. Newly discovered chapters show a count; changing chapters clears the notice while updates preserve the current chapter and scroll position. The reader checks for updates every two seconds, aborts stalled requests after ten seconds and retries, and immediately checks when the window regains focus. It provides chapter navigation, original/translation comparison, font size, night mode, and browser-local reading positions. Its collapsible table of contents groups chapters by language and volume. Volume labels come from chapter-title markers such as 第 X 卷／巻／部; chapters without a marker appear as ungrouped. Previous/next controls appear below the text. The current reader displays text; use an EPUB reader for illustrations. Closing the program stops the reading service; a new launch generates a new address.
 
 **打开已完成小说** (Open a saved book) accepts a translated EPUB or `translation-project.json` / `project.json`, without rerunning translation or starting Ollama. Original text comparison is available when the project contains originals. Legacy projects can still show translations alone; bilingual EPUBs retain their existing bilingual text.
 
-Saved-book indexing runs in the background. Chapters are read on demand, with the latest eight kept in memory. EPUB indexing reads its contents without extracting images. New chapter-file projects cache their reading index in the local user cache and rebuild it when source files change. Legacy monolithic JSON projects require an initial full JSON read. Reader caches do not modify the book or project.
+Saved-book indexing runs in the background. Chapters are read on demand, with the latest eight kept in memory. The reading page checks saved projects approximately every two seconds: newly saved chapters appear automatically and revised text updates while preserving the current chapter, scroll position, and any reading limit. It does not jump to new chapters. EPUB indexing reads its contents without extracting images and refreshes when the file changes. Chapter-file projects cache their reading index in the local user cache and reuse unchanged chapter indexes during updates. Legacy monolithic JSON projects require a full JSON read when the manifest changes. Reader caches do not modify the book or project.
 
 ### Append to a Chinese EPUB
 
@@ -212,6 +234,18 @@ Audits and selective retranslation support both `project.json` and `translation-
 
 ## Storage, upgrades, and backups
 
+The Web UI provides separate persistent acquisition and translation queues. The acquisition and translation submit buttons always add work: idle slots start automatically and busy slots queue it. Duplicate books in the same language locate the existing job, regardless of model or display title. Each queue runs in order, with one translation at a time and a shared browser lease for acquisition. Pause individual books while later books continue; resume paused entries explicitly. Waiting entries offer priority for the next available slot without interrupting current work. Failed entries remain available for retry, edited retry, or cancellation. Queues survive restart in `web-task-queue.json`; completed books remain in the library, with only five recent completion records in the task panel.
+
+“暂停全部” saves and stops current work, then freezes new launches; “继续队列” resumes unfinished acquisition/whole-book translation before waiting books. Pause state survives restart in `web-queue-control.json`. Selective retranslation still needs a fresh review and manual restart. Failed recovery can be cancelled or edited with a new source EPUB/model, including native file selection; queued failures offer edited retries. Renamed/moved originals retain the existing project when their content matches.
+
+Completed network sources offer incremental source updates, optionally followed by queued translation. Only uncached new chapters are fetched; an unchanged catalog keeps the existing EPUB. Changes to the existing chapter order require manual review. “导出诊断信息” exports allowlisted version, phase, progress and error-category data, excluding novel text/titles, URLs, local paths, credentials, configuration and arbitrary logs/errors.
+
+Recovery explains model-service connectivity, missing models, missing source files, and login failures, with a “重试恢复” action. An unavailable model service is retried every ten seconds. Hidden application and reader pages poll every thirty seconds and refresh immediately when visible again. Reading bookmarks use paragraph identity plus offset, preserving position across font-size changes, bilingual display and new text, while accepting old pixel bookmarks.
+
+Before updating glossary, project manifests, acquisition state and chapter JSON, the application retains the latest three valid snapshots under `.backups/<filename>/`. Corrupt files never replace good history. Open “恢复术语与进度备份” on the glossary page, load backups, choose a project directory and snapshot, then restore. Stop active tasks/recovery and resolve unsaved glossary changes first. Restoration replaces one record; maintain consistency between chapter files and their manifest. This does not replace complete project-directory backups.
+
+The same panel creates/restores coherent groups of manifests, their chapters and glossary, retaining three groups with shared storage for unchanged files. Periodic progress snapshots are throttled to five minutes; Web whole-book completion and manual glossary edits also create snapshots. All files are checked before restoration; failures roll back, and interrupted restores resume at startup/project load. Rebuild exported EPUBs after a group restore. Images and other resources still require complete-directory backups.
+
 | File or directory | Contents |
 |---|---|
 | `translation-project.json` | Translation manifest, source identity, language, and progress |
@@ -252,13 +286,15 @@ The application fetches only chapters normally accessible to the current account
 
 ## Development checks
 
+`translator/engine.py` is an independent translation core that imports no UI modules and never prompts for input or opens file dialogs. CLI workflows live in `translator/ui/cli.py`, file selection in `translator/ui/file_dialogs.py`, and shared browser setup in `translator/acquisition/browser_session.py`. GUI, Web, and CLI share translation, auditing, and selective retranslation. Missing models raise errors in the core; download confirmation belongs to the CLI. Start the CLI with `python main.py` or `python -m translator.ui.cli`.
+
 Application code lives in `translator/`, organized into UI, acquisition, formats, translation, glossary, storage, and reading packages. Tests live in `tests/`, helper scripts in `scripts/`, and Web assets in `web/`. Compatibility launchers remain at the root, and existing config and project data paths are preserved. See the [project layout guide](docs/project-layout.md) for details.
 
 Run in the project's virtual environment:
 
 ```powershell
 .venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -t . -v
-node --test tests/test_web_books.js tests/test_web_examples.js
+node --test tests/test_web_books.js tests/test_web_examples.js tests/test_web_terms.js tests/test_reader_updates.js tests/test_web_review.js tests/test_web_controls.js tests/test_web_updates.js
 ```
 
 Tests use local fixtures and simulated model/website responses, without downloading novels or calling real Ollama. They cover stream completeness, cancellation, retry/resume, context-aware caches, migration, selective retranslation, EPUB text/images, and simultaneous acquisition/translation. Passing these tests does not establish real-model translation quality or live-website reliability.
@@ -268,3 +304,5 @@ Tests use local fixtures and simulated model/website responses, without download
 This project is for automation, website parsing, local translation research, and personal study. Rights to original novels, illustrations, and covers remain with their authors and other rights holders. Follow applicable laws and platform terms. Do not publicly distribute unauthorized content, use it for unauthorized commercial gain, bypass access restrictions, or make abusive high-frequency requests. Users are responsible for their use of the software.
 
 Project code is licensed under the [MIT License](LICENSE).
+
+Fully acquired books resume from the local original EPUB and can translate while another book is acquired. Books with incomplete acquisition still require the shared browser. One acquisition and one translation can run concurrently.

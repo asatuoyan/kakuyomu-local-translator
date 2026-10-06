@@ -22,6 +22,8 @@ class AtomicJsonTests(unittest.TestCase):
                 atomic_json(path, {"acquired": 1})
                 attempts = []
                 def locked(source, destination):
+                    if Path(destination) != path:
+                        return replace(source, destination)
                     attempts.append(source)
                     if len(attempts) < 3:
                         self.assertEqual(load_json(path, {}), {"acquired": 1})

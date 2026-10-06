@@ -14,6 +14,7 @@ class Element {
     append(...items) { this.children.push(...items); }
     replaceChildren(...items) { this.children = items; this.textContent = ''; }
     setAttribute(name, value) { this.attributes[name] = value; }
+    addEventListener() {}
     get options() { return this.children; }
 }
 
@@ -27,14 +28,15 @@ function setup(projects) {
     $('model').value = 'installed';
     const context = vm.createContext({
         $, state: {projects, task: {running: false}},
-        booksPage: 1, booksPageSize: 10, booksFingerprint: '', projectsFingerprint: '',
-        manualProject: false, dirty: false, modelsLoading: false,
+        booksPage: 1, booksPageSize: 5, booksFingerprint: '', projectsFingerprint: '',
+        manualProject: false, dirty: false, modelsLoading: false, taskActionPending: false,
         document: {activeElement: null, createElement: () => new Element(),
             querySelectorAll: () => []},
         Option: function(text, value) { this.textContent = text; this.value = value; },
         button: (text, action) => Object.assign(new Element(), {textContent: text, onclick: action}),
-        downloadLink: () => Object.assign(new Element(), {textContent: '下载 EPUB'})
+        downloadLink: (_, label = '下载 EPUB') => Object.assign(new Element(), {textContent: label})
     });
+    vm.runInContext(source.slice(source.indexOf('function moreActions('), source.indexOf("document.addEventListener('click'")), context);
     vm.runInContext(source.slice(source.indexOf('function renderBooks()'), source.indexOf('function renderStatus()')), context);
     context.renderBooks();
     return {context, $};
@@ -45,19 +47,41 @@ const projects = Array.from({length: 23}, (_, index) => ({
     completed: index % 2 === 0, resume: {}, download: 'book.epub'
 }));
 
-test('ten books per page, navigation and all project options remain available', () => {
+test('network books can queue incremental updates with or without follow-up translation', async () => {
+    const {context, $} = setup([{id: 'book', title: 'fixture', kind: 'source', completed: true,
+        update_url: 'https://kakuyomu.jp/works/123', source_download: 'original.epub', language: 'original'}]);
+    $('language').value = 'en';
+    const calls = [];
+    context.api = async (route, body) => { calls.push({route, body}); return {}; };
+    context.tab = () => {}; context.notice = () => {}; context.poll = async () => {};
+    const actions = $('books').children[0].children[1].children.at(-1).children[1].children;
+    await actions.find(item => item.className === 'checkUpdates').onclick();
+    await actions.find(item => item.className === 'checkSourceUpdates').onclick();
+    assert.equal(calls[0].route, 'check-book-updates');
+    assert.equal(calls[0].body.translate, true);
+    assert.equal(calls[0].body.language, 'en');
+    assert.equal(calls[1].body.translate, false);
+});
+
+test('five books per page, navigation and all project options remain available', () => {
     const {$} = setup(projects);
-    assert.equal($('books').children.length, 10);
+    assert.equal($('books').children.length, 5);
     assert.equal($('project').children.length, 23);
     assert.equal($('booksPrevious').disabled, true);
     $('booksNext').onclick();
-    assert.equal($('books').children[0].children[0].children[0].textContent, 'Novel 10');
+    assert.equal($('books').children[0].children[0].children[0].textContent, 'Novel 5');
+    $('booksNext').onclick();
+    $('booksNext').onclick();
     $('booksNext').onclick();
     assert.equal($('books').children.length, 3);
     assert.equal($('booksNext').disabled, true);
     assert.match($('booksPagination').textContent, /23/);
     assert.deepEqual($('books').children[0].children[1].children.map(item => item.textContent),
-        ['阅读', '术语', '继续翻译', '下载 EPUB']);
+        ['阅读', '继续翻译', '']);
+    const menu = $('books').children[0].children[1].children.at(-1);
+    assert.equal(menu.children[0].textContent, '更多');
+    assert.equal(menu.children[1].children[0].textContent, '下载 EPUB');
+    assert.doesNotMatch($('books').children[0].children[0].children[1].textContent, /术语/);
 });
 
 test('search and completion filters reset the page and handle no matches', () => {
@@ -129,8 +153,27 @@ test('completion keeps the current page and offers a books-page entry', () => {
     context.renderStatus();
     assert.equal($('translatePage').hidden, false);
     const actions = $('result').children;
-    assert.deepEqual(actions.map(item => item.textContent), ['下载 EPUB', '阅读译文', '查看我的作品']);
+    assert.deepEqual(actions.map(item => item.textContent), ['下载 EPUB', '阅读译文', '查看小说书库']);
     actions[2].onclick();
     assert.equal($('booksPage').hidden, false);
     assert.equal($('translatePage').hidden, true);
+});
+
+test('acquired originals provide download and translation without unavailable reader actions', () => {
+    const { $ } = setup([{id: 'source', kind: 'source', title: 'Original', acquired_chapters: 10,
+        total_chapters: 10, chapters: 0, completed: true, source_download: 'source.epub',
+        resume: {source: 'source.epub'}}]);
+    const row = $('books').children[0];
+    assert.match(row.children[0].children[1].textContent, /10\/10.*尚未翻译/);
+    assert.deepEqual(row.children[1].children.map(item => item.textContent), ['开始翻译', '']);
+    assert.equal(row.children[1].children.at(-1).children[1].children[0].textContent, '下载原文');
+});
+
+test('translating books expose completed original independently of translated EPUB', () => {
+    const { $ } = setup([{id: 'book', title: 'Translation', acquired_chapters: 10, total_chapters: 10,
+        chapters: 2, completed: false, source_download: 'original.epub'}]);
+    const row = $('books').children[0];
+    assert.match(row.children[0].children[1].textContent, /已译 2\/10.*原文已获取 10\/10/);
+    assert.deepEqual(row.children[1].children.map(item => item.textContent), ['阅读', '']);
+    assert.equal(row.children[1].children.at(-1).children[1].children[0].textContent, '下载原文');
 });

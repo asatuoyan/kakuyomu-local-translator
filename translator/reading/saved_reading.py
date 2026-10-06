@@ -11,19 +11,23 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
-from translator.storage.project_storage import atomic_json
+from translator.storage.project_storage import atomic_json, load_json
 
 
 class SavedReading:
     def __init__(self, path, *, chapter_limit=None):
         self.path = Path(path).resolve()
         self.identity = str(self.path)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.loaded = OrderedDict()
         self.entries = []
         self.title = self.path.stem
         self.language = "译文"
         self.legacy = None
+        self.revision = 1
+        self.chapter_limit = chapter_limit
+        self._source_files = [self.path]
+        self._signature = (self._stamp(self.path),)
         if self.path.suffix.lower() == ".epub":
             self._epub_index()
         else:
@@ -34,6 +38,14 @@ class SavedReading:
             self.entries = self.entries[:chapter_limit]
         if not self.entries:
             raise ValueError("所选文件没有可阅读的章节。")
+        self._build_catalog()
+
+    @staticmethod
+    def _stamp(path):
+        stat = path.stat()
+        return str(path), stat.st_size, stat.st_mtime_ns
+
+    def _build_catalog(self):
         self.catalog = []
         volume = "未分卷"
         import re
@@ -41,7 +53,43 @@ class SavedReading:
             match = re.search(r"第\s*[0-9０-９一二三四五六七八九十百千零〇两]+\s*[卷巻部]", entry["title"])
             volume = entry.get("volume") or (match.group(0) if match else volume)
             self.catalog.append({"id": str(i), "title": entry["title"], "language": self.language,
-                                 "volume": volume, "revision": 1})
+                                 "volume": volume, "revision": self.revision})
+
+    def _source_stamps(self, files):
+        # Windows directory entries carry file metadata: enumerate once instead
+        # of opening every chapter path separately on each reader poll.
+        chapter_dir = self.path.parent / "chapters"
+        chapters = [p for p in files if p.parent == chapter_dir]
+        stamps = {}
+        if chapters:
+            wanted = {p.name for p in chapters}
+            with os.scandir(chapter_dir) as directory:
+                for entry in directory:
+                    if entry.name in wanted:
+                        stat = entry.stat()
+                        stamps[entry.name] = (str(chapter_dir / entry.name), stat.st_size, stat.st_mtime_ns)
+        return tuple(stamps[p.name] if p.parent == chapter_dir and p.name in stamps else self._stamp(p)
+                     for p in files)
+
+    def refresh(self):
+        """Refresh changed sources without changing the book or reading range."""
+        with self.lock:
+            if self._source_stamps(self._source_files) == self._signature:
+                return False
+            # Construct first so a failed read never leaves a partial directory.
+            updated = SavedReading(self.path, chapter_limit=self.chapter_limit)
+            for name in ("entries", "title", "language", "legacy", "_source_files", "_signature"):
+                setattr(self, name, getattr(updated, name))
+            self.revision += 1
+            self.loaded.clear()
+            self._build_catalog()
+            return True
+
+    def catalog_snapshot(self):
+        with self.lock:
+            self.refresh()
+            return {"book": self.identity, "title": self.title,
+                    "chapters": [dict(entry) for entry in self.catalog]}
 
     def _epub_index(self):
         with ZipFile(self.path) as archive:
@@ -85,7 +133,9 @@ class SavedReading:
     def _project_index(self):
         if self.path.name not in {"translation-project.json", "project.json"}:
             raise ValueError("请选择译文 EPUB 或项目清单。")
-        state = json.loads(self.path.read_text(encoding="utf-8"))
+        manifest_stamp = self._stamp(self.path)
+        state = load_json(self.path, {})
+        self._signature = (manifest_stamp,)
         self.title = state.get("metadata", {}).get("title") or state.get("title") or self.path.parent.name
         self.language = state.get("language") or "译文"
         if state.get("schema_version") != 2 or self.path.name != "translation-project.json":
@@ -94,33 +144,44 @@ class SavedReading:
                             for i, ch in enumerate(self.legacy) if any(ch.get("translation") or ch.get("paragraphs", []))]
             return
         files = [self.path.parent / "chapters" / f"{i:06d}.json" for i in range(1, state["chapter_count"] + 1)]
-        fingerprint = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in [self.path, *files]]
+        self._source_files = [self.path, *files]
+        fingerprint = [manifest_stamp, *self._source_stamps(files)]
+        self._signature = tuple(fingerprint)
         digest = hashlib.sha256(json.dumps(fingerprint).encode()).hexdigest()
         cache_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".cache"))) / "kakuyomu-local-translator" / "reader-cache"
         cache_path = cache_root / (hashlib.sha256(self.identity.encode()).hexdigest() + ".json")
         try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached = load_json(cache_path, {})
         except (OSError, ValueError):
             cached = {}
         if cached.get("fingerprint") == digest:
             self.entries = cached["entries"]
             return
-        for p in files:
-            ch = json.loads(p.read_text(encoding="utf-8"))
-            if any(ch.get("translation") or ch.get("paragraphs", [])):
-                self.entries.append({"file": str(p), "title": ch.get("title") or ch.get("episode_title") or p.stem})
+        records = {}
+        for p, stamp in zip(files, fingerprint[1:]):
+            previous = cached.get("records", {}).get(str(p), {})
+            if previous.get("signature") == list(stamp):
+                entry = previous.get("entry")
+            else:
+                ch = load_json(p, {})
+                entry = ({"file": str(p), "title": ch.get("title") or ch.get("episode_title") or p.stem}
+                         if any(ch.get("translation") or ch.get("paragraphs", [])) else None)
+            records[str(p)] = {"signature": stamp, "entry": entry}
+            if entry:
+                self.entries.append(entry)
         try:
-            atomic_json(cache_path, {"fingerprint": digest, "entries": self.entries})
+            atomic_json(cache_path, {"fingerprint": digest, "entries": self.entries, "records": records})
         except OSError:
             pass
 
     def chapter(self, key):
-        if not key.isascii() or not key.isdecimal() or not 1 <= int(key) <= len(self.entries) or str(int(key)) != key:
-            return None
         with self.lock:
+            self.refresh()
+            if not key.isascii() or not key.isdecimal() or not 1 <= int(key) <= len(self.entries) or str(int(key)) != key:
+                return None
             if key in self.loaded:
                 self.loaded.move_to_end(key)
-                return self.loaded[key]
+                return {**self.loaded[key], "revision": self.revision}
             entry = self.entries[int(key) - 1]
             title = entry["title"]
             if self.path.suffix.lower() == ".epub":
@@ -154,10 +215,10 @@ class SavedReading:
                 flush()
                 originals = [""] * len(texts)
             else:
-                ch = self.legacy[entry["record"]] if self.legacy is not None else json.loads(Path(entry["file"]).read_text(encoding="utf-8"))
+                ch = self.legacy[entry["record"]] if self.legacy is not None else load_json(Path(entry["file"]), {})
                 texts = ch.get("translation") or ch.get("paragraphs", [])
                 originals = ((ch.get("source_paragraphs") or ch.get("japanese") or []) + [""] * len(texts))[:len(texts)]
-            result = {"title": title, "originals": originals, "translations": texts, "revision": 1}
+            result = {"title": title, "originals": originals, "translations": texts, "revision": self.revision}
             self.loaded[key] = result
             while len(self.loaded) > 8:
                 self.loaded.popitem(last=False)

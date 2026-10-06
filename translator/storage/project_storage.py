@@ -24,6 +24,7 @@ def load_json(path: Path, default):
 
 
 def atomic_json(path: Path, value) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
@@ -31,23 +32,35 @@ def atomic_json(path: Path, value) -> None:
             json.dump(value, stream, ensure_ascii=False, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
-        for attempt in range(11):
-            try:
-                with _json_file_lock:
-                    os.replace(name, path)
-                break
-            except OSError as exc:
-                # Other processes (including antivirus) can briefly hold the
-                # destination too. Retry only Windows access/sharing failures;
-                # retain atomic replacement and propagate persistent errors.
-                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 10:
-                    raise
-                time.sleep(min(.05 * (attempt + 1), .25))
+        # Serialize the commit and history rotation, while allowing readers to
+        # proceed during potentially expensive JSON encoding and file flushing.
+        with _json_file_lock:
+            if path.name in {"glossary.json", "translation-project.json", "project.json", "network.json"} or path.parent.name == "chapters":
+                from translator.storage.backups import preserve
+                preserve(path)
+            replace_file(name, path)
     finally:
         Path(name).unlink(missing_ok=True)
 
 
+def replace_file(source, destination):
+    for attempt in range(11):
+        try:
+            with _json_file_lock:
+                os.replace(source, destination)
+            break
+        except OSError as exc:
+            # Other processes (including antivirus) can briefly hold the
+            # destination too. Retry only Windows access/sharing failures;
+            # retain atomic replacement and propagate persistent errors.
+            if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 10:
+                raise
+            time.sleep(min(.05 * (attempt + 1), .25))
+
+
 def load_translation_state(path: Path) -> dict:
+    from translator.storage.group_backups import recover_group_restore
+    recover_group_restore(path.parent)
     state = load_json(path, {})
     if state.get("schema_version") == 2:
         state["chapters"] = [
@@ -60,17 +73,20 @@ def load_translation_state(path: Path) -> dict:
 
 
 def save_translation_state(path: Path, state: dict, changed: list[int] | None = None) -> None:
-    # Legacy projects are migrated only after a successful load; retain an exact backup.
-    if state.get("schema_version") != 2:
-        if path.exists() and not path.with_suffix(".legacy.json").exists():
-            atomic_json(path.with_suffix(".legacy.json"), load_json(path, {}))
-        changed = list(range(len(state["chapters"])))
-    for index in changed or []:
-        atomic_json(path.parent / "chapters" / f"{index + 1:06d}.json", state["chapters"][index])
-    manifest = {key: value for key, value in state.items() if key != "chapters"}
-    manifest.update(schema_version=2, chapter_count=len(state["chapters"]))
-    atomic_json(path, manifest)
-    state.update(schema_version=2, chapter_count=len(state["chapters"]))
+    with _json_file_lock:
+        # Legacy projects are migrated only after a successful load; retain an exact backup.
+        if state.get("schema_version") != 2:
+            if path.exists() and not path.with_suffix(".legacy.json").exists():
+                atomic_json(path.with_suffix(".legacy.json"), load_json(path, {}))
+            changed = list(range(len(state["chapters"])))
+        for index in changed or []:
+            atomic_json(path.parent / "chapters" / f"{index + 1:06d}.json", state["chapters"][index])
+        manifest = {key: value for key, value in state.items() if key != "chapters"}
+        manifest.update(schema_version=2, chapter_count=len(state["chapters"]))
+        atomic_json(path, manifest)
+        state.update(schema_version=2, chapter_count=len(state["chapters"]))
+        from translator.storage.group_backups import checkpoint
+        checkpoint(path.parent)
 
 
 class TranslationCache:

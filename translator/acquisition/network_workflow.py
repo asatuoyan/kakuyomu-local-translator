@@ -26,8 +26,9 @@ def _wait(seconds, cfg):
         time.sleep(min(.2, max(0, end - time.monotonic())))
 
 
-def acquire_source(url, cfg, count, *, full=False, progress=None, work_ready=None, chapter_ready=None):
-    from translator.engine import _launch_context, select_active_page, check_translation_cancelled
+def acquire_source(url, cfg, count, *, full=False, progress=None, work_ready=None, chapter_ready=None, updates_only=False):
+    from translator.acquisition.browser_session import launch_context as _launch_context, select_active_page
+    from translator.engine import check_translation_cancelled
     url = normalize_work_url(url)
     path = network_path(url, cfg)
     state = load_json(path, {})
@@ -37,23 +38,46 @@ def acquire_source(url, cfg, count, *, full=False, progress=None, work_ready=Non
     cache = load_json(cache_path, {})
     # The filename participates in translation project routing; isolate each work.
     source = folder / f"source_{folder.name}.epub"
-    state.update(url=url, source=str(source.resolve()), stage="acquiring", preview_count=count)
+    state.update(url=url, source=str(source.resolve()), stage="acquiring", preview_count=count,
+                 acquisition_complete=state.get("acquisition_complete", False) if updates_only else False)
     atomic_json(path, state)
     with sync_playwright() as playwright:
-        context = _launch_context(playwright, cfg, prompt_for_cookies=False)
+        automatic_login = cfg.get("_automatic_browser_login", False)
+        browser_cfg = {**cfg, "headless": True} if automatic_login else cfg
+        context = _launch_context(playwright, browser_cfg, prompt_for_cookies=False)
         try:
             check_translation_cancelled(cfg)
             page = select_active_page(context)
             on_login = open_work_page(page, url, allow_login=True)
             if on_login:
-                if cfg.get("headless"):
+                if automatic_login:
+                    context.close()
+                    context = None
+                    check_translation_cancelled(cfg)
+                    context = _launch_context(playwright, {**cfg, "headless": False}, prompt_for_cookies=False)
+                    page = select_active_page(context)
+                    on_login = open_work_page(page, url, allow_login=True)
+                elif cfg.get("headless"):
                     raise ValueError("请先用“登录 Kakuyomu”完成登录，再启动一键试译。")
                 if progress:
                     progress(0, "请在打开的浏览器中完成登录，完成后自动继续……")
                 while "/auth/" in page.url:
                     check_translation_cancelled(cfg)
+                    if page.is_closed():
+                        raise ValueError("登录窗口已关闭，尚未完成登录。请重新启动获取。")
                     page.wait_for_timeout(250)
                 open_work_page(page, url)
+                if automatic_login:
+                    # Closing flushes the persistent profile before the same profile
+                    # is reopened without a window; login credentials stay local.
+                    context.close()
+                    context = None
+                    check_translation_cancelled(cfg)
+                    context = _launch_context(playwright, browser_cfg, prompt_for_cookies=False)
+                    page = select_active_page(context)
+                    open_work_page(page, url)
+                    if progress:
+                        progress(0, "登录完成，已隐藏浏览器，继续获取……")
             work = extract_work_info(page, url)
             check_translation_cancelled(cfg)
             requested = len(work.episodes) if full else max(count, int(state.get("acquired_chapters", 0)))
@@ -64,6 +88,13 @@ def acquire_source(url, cfg, count, *, full=False, progress=None, work_ready=Non
             current_urls = [item["url"] for item in work.episodes]
             if previous_urls and current_urls[:len(previous_urls)] != previous_urls:
                 raise ValueError("已获取章节的目录顺序发生变化，请核对后使用新的项目。")
+            if updates_only and previous_urls == current_urls and source.is_file():
+                state.update(work=asdict(work), total_chapters=len(current_urls), stage="acquired",
+                             acquired_chapters=len(current_urls), acquisition_complete=True)
+                atomic_json(path, state)
+                if progress:
+                    progress(100, "原站没有新增章节")
+                return source, work
             if work_ready:
                 work_ready(source, work, cache)
             chapters = []
@@ -84,6 +115,8 @@ def acquire_source(url, cfg, count, *, full=False, progress=None, work_ready=Non
                                             paragraphs=record["paragraphs"], blocks=record["blocks"], images=images)
                 else:
                     fresh = True
+                    if updates_only and i <= len(previous_urls):
+                        raise ValueError("已获取章节的原文缓存缺失，请恢复 source-cache.json 后再检查新增章节")
                     chapter = extract_source_chapter(page, item["url"], item["title"])
                     check_translation_cancelled(cfg)
                     download_chapter_images(context, chapter)
@@ -123,11 +156,13 @@ def acquire_source(url, cfg, count, *, full=False, progress=None, work_ready=Non
             build_source_epub(work, chapters, temporary, cover=cover)
             temporary.replace(source)
             state.update(work=asdict(work), source_urls=[c.url for c in chapters],
-                         acquired_chapters=len(chapters), total_chapters=len(work.episodes), stage="acquired")
+                         acquired_chapters=len(chapters), total_chapters=len(work.episodes), stage="acquired",
+                         acquisition_complete=len(chapters) == len(work.episodes))
             atomic_json(path, state)
             return source, work
         finally:
-            context.close()
+            if context is not None:
+                context.close()
 
 
 def run_network_workflow(url, cfg, languages, count=20, *, full=False, progress=None, source_ready=None):

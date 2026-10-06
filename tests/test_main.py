@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import translator.engine as main
+import translator.ui.cli as cli
 
 
 class FakeResponse:
@@ -308,11 +309,11 @@ class ExistingProjectTests(unittest.TestCase):
             (work_dir / "base-original.epub").write_bytes(source.read_bytes())
             project = {"base_epub": "base-original.epub", "chapters": [{"title": "舊章"}]}
             main.atomic_json(work_dir / "project.json", project)
-            with patch("translator.engine.select_epub_file", return_value=source), \
-                 patch("translator.engine.inspect_epub", return_value={"title": "小說"}), \
-                 patch("translator.engine.save_last_project"), \
-                 patch("translator.engine.create_project_from_epub") as create:
-                self.assertEqual(main.import_epub({"output_dir": str(root)}), work_dir)
+            with patch("translator.ui.cli.select_epub_file", return_value=source), \
+                 patch("translator.ui.cli.inspect_epub", return_value={"title": "小說"}), \
+                 patch("translator.ui.cli.save_last_project"), \
+                 patch("translator.ui.cli.create_project_from_epub") as create:
+                self.assertEqual(cli.import_epub({"output_dir": str(root)}), work_dir)
             create.assert_not_called()
             self.assertEqual(main.load_json(work_dir / "project.json", {}), project)
 

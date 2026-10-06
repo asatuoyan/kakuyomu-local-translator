@@ -6,8 +6,17 @@
 |---|---|
 | `run.bat`、`run_gui.bat`、`run_web.bat` | 双击启动入口 |
 | `main.py`、`gui.py`、`web_app.py` | CLI、GUI、Web 的兼容启动入口 |
-| `translator/engine.py` | 翻译引擎与 CLI 流程 |
+| `translator/engine.py` | 不依赖界面的翻译核心，不创建窗口或请求用户输入 |
+| `translator/ui/cli.py`、`translator/ui/file_dialogs.py` | 命令行菜单、交互流程与文件选择弹窗 |
+| `translator/acquisition/browser_session.py` | GUI、Web 与 CLI 共用的浏览器会话配置；Cookie 确认由 CLI 处理 |
 | `translator/ui/` | Web 服务、GUI 界面、对话框与阅读服务 |
+| `translator/ui/web_library.py` | 书库发现、元数据缓存与最近任务 |
+| `translator/ui/web_recovery.py`、`translator/ui/task_errors.py` | 自动恢复、停止、重试与失败原因分类 |
+| `translator/ui/web_queue.py` | 获取、翻译的持久化队列与独立调度 |
+| `translator/ui/web_backups.py`、`translator/storage/backups.py` | 备份浏览、恢复与有数量上限的有效文件快照 |
+| `translator/storage/group_backups.py` | 同一时点的项目整组快照、文件校验与可接续的恢复事务 |
+| `translator/ui/web_book_updates.py` | 原站增量更新检查与获取后的续译调度 |
+| `translator/ui/web_diagnostics.py` | 不含正文、凭据或任意日志的诊断信息导出 |
 | `translator/acquisition/` | 网站获取、浏览器正文读取、原文章节与 EPUB 处理 |
 | `translator/formats/` | EPUB 追加、文本导入、JAR 与 UMD 格式解析 |
 | `translator/translation/` | 翻译流程、获取与翻译流水线、提示词、模型预设、自适应分批与质量检查 |
@@ -24,7 +33,7 @@
 | `config.example.json`、`requirements.txt` | 配置示例与依赖清单 |
 | `config.json`、`output/`、`browser-profile-*/`、`.venv/` | 用户配置、项目数据、浏览器会话与本机环境，路径保持不变 |
 
-直接运行 `python main.py`、`python gui.py` 和 `python web_app.py` 的方式保持可用。导入这三个兼容入口时，会使用对应实现模块，因此既有 `main`、`gui`、`web_app` 调用仍引用同一份模块状态。新增代码和测试使用完整包路径，例如 `translator.engine`、`translator.ui.web_app`、`translator.domain`、`translator.acquisition.chapter_reader` 和 `translator.storage.translation_book`，其余旧的根目录模块名已移除。
+直接运行 `python main.py`、`python gui.py` 和 `python web_app.py` 的方式保持可用。`main.py` 执行时启动 `translator.ui.cli`，导入时仍指向 `translator.engine` 的翻译 API；命令行菜单和文件选择函数改从 `translator.ui.cli` 或 `translator.ui.file_dialogs` 导入。`gui`、`web_app` 导入时仍指向各自实现模块。新增代码和测试使用完整包路径，例如 `translator.engine`、`translator.ui.web_app`、`translator.domain`、`translator.acquisition.chapter_reader` 和 `translator.storage.translation_book`。
 
 配置、网页资源和启动脚本统一使用 `translator.paths` 中的项目根目录，业务代码的位置不会改变 `config.json`、`output/`、浏览器配置或旧作品的路径。移动模块时应同时更新测试中的 mock 目标，指向实际实现模块。
 
@@ -32,7 +41,7 @@
 
 ```powershell
 .venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -t . -v
-node --test tests/test_web_books.js tests/test_web_examples.js
+node --test tests/test_web_*.js tests/test_reader_updates.js
 ```
 
 也支持原来的 `python -m unittest discover`。运行单个测试模块时使用包名，例如 `python -m unittest tests.test_streaming_workflow`。

@@ -87,6 +87,8 @@ def run_streaming_workflow(url, cfg, language, progress=None, counts=None):
             if cfg.get("_task_stage"):
                 cfg["_task_stage"]("acquisition", f"获取停止：{exc}")
         finally:
+            if cfg.get("_acquisition_finished"):
+                cfg["_acquisition_finished"]()
             if not stopped.is_set() and not cancelled():
                 try:
                     put(("end",))

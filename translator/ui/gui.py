@@ -63,15 +63,13 @@ from translator.formats.text_importer import (
     import_text_source,
     import_text_to_epub,
 )
+from translator.acquisition.browser_session import launch_context as _launch_context, select_active_page
 from translator.engine import (
     CONFIG_PATH,
     Episode,
     TranslationBook,
     TranslationCancelled,
     _translated_chapter,
-    _choose_browser,
-    _launch_context,
-    _select_range,
     add_or_update_project,
     ensure_model,
     load_config,
@@ -79,7 +77,6 @@ from translator.engine import (
     atomic_json,
     TRANSLATION_MODELS,
     safe_name,
-    select_active_page,
     translate_episode,
 )
 from playwright.sync_api import Error as PlaywrightError, sync_playwright

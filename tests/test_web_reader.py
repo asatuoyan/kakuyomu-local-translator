@@ -6,9 +6,61 @@ from translator.ui.web_reader import ReadingServer, load_saved_reading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from translator.reading.saved_reading import SavedReading
+from translator.storage.project_storage import atomic_json
 
 
 class WebReaderTests(unittest.TestCase):
+    def test_live_book_switch_keeps_previous_address_isolated(self):
+        server = ReadingServer()
+        self.addCleanup(server.close)
+        server.reset("first")
+        server.update(("en", 1, "one", [], ["first text"]))
+        previous = server.url()
+        server.reset("second")
+        server.update(("en", 1, "two", [], ["second text"]))
+        self.assertNotEqual(previous, server.url())
+        self.assertEqual(json.load(urlopen(previous + "catalog"))["book"], "first")
+        self.assertEqual(json.load(urlopen(previous + "chapter?id=en:1"))["translations"], ["first text"])
+        self.assertEqual(json.load(urlopen(server.url() + "catalog"))["book"], "second")
+
+    def test_saved_reader_redirect_pins_browser_and_respects_reading_limit(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "translation-project.json"
+            atomic_json(path, {"metadata": {"title": "Saved"}, "chapters": [
+                {"title": "one", "paragraphs": ["one"]}, {"title": "two", "paragraphs": ["two"]}]})
+            server = ReadingServer()
+            self.addCleanup(server.close)
+            server.open_saved(SavedReading(path))
+            with urlopen(server.url()) as response:
+                pinned = response.url
+            self.assertNotEqual(pinned, server.url())
+            limited = server.open_book(SavedReading(path, chapter_limit=1))
+            self.assertNotEqual(pinned, limited)
+            server.reset("another")
+            self.assertEqual(len(json.load(urlopen(pinned + "catalog"))["chapters"]), 2)
+            self.assertEqual(len(json.load(urlopen(limited + "catalog"))["chapters"]), 1)
+
+    def test_saved_book_addresses_stay_isolated_and_keep_refreshing(self):
+        with TemporaryDirectory() as directory:
+            first, second = [Path(directory) / name / "translation-project.json" for name in ("one", "two")]
+            for path, title in ((first, "Book one"), (second, "Book two")):
+                atomic_json(path, {"metadata": {"title": title}, "chapters": [{"title": title, "paragraphs": [title]}]})
+            server = ReadingServer()
+            try:
+                first_url = server.open_book(SavedReading(first))
+                second_url = server.open_book(SavedReading(second))
+                self.assertNotEqual(first_url, second_url)
+                self.assertEqual(server.open_book(SavedReading(first)), first_url)
+                server.reset("different live book")
+                self.assertEqual(json.load(urlopen(first_url + "catalog"))["title"], "Book one")
+                self.assertEqual(json.load(urlopen(second_url + "chapter?id=1"))["translations"], ["Book two"])
+                atomic_json(first, {"metadata": {"title": "Book one"}, "chapters": [
+                    {"title": "one", "paragraphs": ["one"]}, {"title": "new", "paragraphs": ["new"]}]})
+                self.assertEqual(len(json.load(urlopen(first_url + "catalog"))["chapters"]), 2)
+                self.assertEqual(len(json.load(urlopen(second_url + "catalog"))["chapters"]), 1)
+            finally:
+                server.close()
     def test_saved_project_reading_does_not_require_source_or_modify_files(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "translation-project.json"

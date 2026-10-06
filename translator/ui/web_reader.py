@@ -55,6 +55,9 @@ class ReadingServer:
         self.lock = threading.Lock()
         self.book = ""
         self.saved = None
+        self.saved_books = {}
+        self.book_tokens = {}
+        self.live_books = {}
         self.chapters = {}
         self.revision = 0
         self.token = secrets.token_urlsafe(24)
@@ -63,17 +66,34 @@ class ReadingServer:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 path = urlsplit(self.path)
-                prefix = "/" + owner.token
-                if path.path == prefix + "/":
+                parts = path.path.split("/", 2)
+                if len(parts) != 3:
+                    self.send_error(404)
+                    return
+                token, route = parts[1], "/" + parts[2]
+                with owner.lock:
+                    if token != owner.token and token not in owner.saved_books and token not in owner.live_books:
+                        self.send_error(404)
+                        return
+                    saved = owner.saved if token == owner.token else owner.saved_books.get(token)
+                    live_book, live_chapters = ((owner.book, owner.chapters) if token == owner.token
+                                                else owner.live_books.get(token, ("", {})))
+                if route == "/":
+                    if token == owner.token and saved is not None:
+                        self.send_response(302)
+                        self.send_header("Location", urlsplit(owner.open_book(saved)).path)
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                     data = (WEB_DIR / "reader.html").read_bytes()
                     mime = "text/html; charset=utf-8"
-                elif path.path in (prefix + "/catalog", prefix + "/chapter"):
+                elif route in ("/catalog", "/chapter"):
                     with owner.lock:
-                        saved = owner.saved
                         if path.path.endswith("catalog"):
                             entries = []
                             volumes = {}
-                            for key, value in sorted(owner.chapters.items(), key=lambda item: (item[1]["language"], item[1]["index"])):
+                            for key, value in sorted(live_chapters.items(), key=lambda item: (item[1]["language"], item[1]["index"])):
                                 language = value["language"]
                                 match = re.search(r"第\s*[0-9０-９一二三四五六七八九十百千零〇两壱弐参]+\s*[卷巻部]", value["chapter_title"])
                                 if match:
@@ -81,16 +101,14 @@ class ReadingServer:
                                 entries.append({"id": key, "title": value["title"],
                                                 "revision": value["revision"], "language": language,
                                                 "volume": volumes.get(language, "未分卷")})
-                            result = {"book": owner.book, "chapters": entries}
+                            result = {"book": live_book, "chapters": entries}
                         else:
                             key = parse_qs(path.query).get("id", [""])[0]
-                            result = owner.chapters.get(key)
+                            result = live_chapters.get(key)
                     if saved is not None:
                         try:
-                            result = ({"book": saved.identity, "title": saved.title, "chapters": saved.catalog}
+                            result = (saved.catalog_snapshot()
                                       if path.path.endswith("catalog") else saved.chapter(key))
-                            if result is not None and path.path.endswith("chapter"):
-                                result = {**result, "revision": saved.revision}
                         except (OSError, ValueError, KeyError) as exc:
                             self.send_error(500, "Chapter could not be loaded")
                             return
@@ -118,6 +136,28 @@ class ReadingServer:
     def url(self, host="127.0.0.1"):
         return f"http://{host}:{self.http.server_port}/{self.token}/"
 
+    def open_book(self, saved):
+        """Bind an address to a saved book without changing other readers."""
+        with self.lock:
+            identity = (saved.identity, saved.chapter_limit)
+            token = self.book_tokens.get(identity)
+            if token is None:
+                token = secrets.token_urlsafe(24)
+                self.book_tokens[identity] = token
+                self.saved_books[token] = saved
+        return f"http://127.0.0.1:{self.http.server_port}/{token}/"
+
+    def open_path(self, path):
+        """Reuse the existing on-demand reader and its chapter cache."""
+        identity = (str(Path(path).resolve()), None)
+        with self.lock:
+            token = self.book_tokens.get(identity)
+            saved = self.saved_books.get(token)
+        if saved is None:
+            from translator.reading.saved_reading import SavedReading
+            saved = SavedReading(path)
+        return self.open_book(saved)
+
     def lan_urls(self):
         physical = physical_lan_addresses()
         if physical is not None:
@@ -137,19 +177,30 @@ class ReadingServer:
 
     def reset(self, book):
         with self.lock:
+            if self.book and self.book != book:
+                self._archive_current()
             self.book = book
             self.saved = None
             self.chapters.clear()
 
     def open_saved(self, saved):
         with self.lock:
-            self.revision += 1
+            if self.book and self.book != saved.identity:
+                self._archive_current()
+            self.revision = max(self.revision, getattr(self.saved, "revision", 0)) + 1
             saved.revision = self.revision
             for entry in getattr(saved, "catalog", []):
                 entry["revision"] = saved.revision
             self.book = saved.identity
             self.saved = saved
             self.chapters.clear()
+
+    def _archive_current(self):
+        if self.saved is not None:
+            self.saved_books[self.token] = self.saved
+        else:
+            self.live_books[self.token] = self.book, dict(self.chapters)
+        self.token = secrets.token_urlsafe(24)
 
     def update(self, payload):
         language, index, title, originals, translations = payload

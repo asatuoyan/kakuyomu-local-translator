@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import translator.engine as main
+import translator.ui.cli as cli
 from translator.ui.gui_settings import model_choices
 
 
@@ -35,26 +36,26 @@ class ModelSelectionTests(unittest.TestCase):
     def test_deployed_local_model_can_be_selected_without_download(self):
         cfg = {"model": main.DEFAULT_MODEL, "ollama_url": "http://localhost:11434"}
         with patch("builtins.input", side_effect=["3", "1"]), patch(
-            "translator.engine.installed_models", return_value={"my-translator:latest"}
-        ), patch("translator.engine.pull_model") as pull:
-            self.assertTrue(main.select_model(cfg))
+            "translator.ui.cli.installed_models", return_value={"my-translator:latest"}
+        ), patch("translator.ui.cli.pull_model") as pull:
+            self.assertTrue(cli.select_model(cfg))
         self.assertEqual(cfg["model"], "my-translator:latest")
         pull.assert_not_called()
 
     def test_local_model_discovery_failure_preserves_configuration(self):
         cfg = {"model": main.DEFAULT_MODEL}
         with patch("builtins.input", return_value="3"), patch(
-            "translator.engine.installed_models", side_effect=RuntimeError("无法连接 Ollama")
+            "translator.ui.cli.installed_models", side_effect=RuntimeError("无法连接 Ollama")
         ):
-            self.assertFalse(main.select_model(cfg))
+            self.assertFalse(cli.select_model(cfg))
         self.assertEqual(cfg["model"], main.DEFAULT_MODEL)
 
     def test_custom_model_name_can_be_selected(self):
         cfg = {"model": main.DEFAULT_MODEL}
         with patch("builtins.input", side_effect=["4", " local:custom "]), patch(
-            "translator.engine.ensure_model", return_value=True
+            "translator.ui.cli.ensure_model", return_value=True
         ):
-            self.assertTrue(main.select_model(cfg))
+            self.assertTrue(cli.select_model(cfg))
         self.assertEqual(cfg["model"], "local:custom")
 
     def test_only_installed_models_are_selectable(self):
@@ -66,15 +67,15 @@ class ModelSelectionTests(unittest.TestCase):
     def test_both_models_can_be_selected_without_changing_chunk_settings(self):
         for choice, model in enumerate(main.TRANSLATION_MODELS.values(), 1):
             cfg = {"model": main.DEFAULT_MODEL, "translation_chunk_chars": 1234}
-            with patch("builtins.input", return_value=str(choice)), patch("translator.engine.ensure_model", return_value=True):
-                self.assertTrue(main.select_model(cfg))
+            with patch("builtins.input", return_value=str(choice)), patch("translator.ui.cli.ensure_model", return_value=True):
+                self.assertTrue(cli.select_model(cfg))
             self.assertEqual(cfg["model"], model)
             self.assertEqual(cfg["translation_chunk_chars"], 1234)
 
     def test_failed_model_selection_preserves_configuration(self):
         cfg = {"model": main.DEFAULT_MODEL}
-        with patch("builtins.input", return_value="1"), patch("translator.engine.ensure_model", return_value=False):
-            self.assertFalse(main.select_model(cfg))
+        with patch("builtins.input", return_value="1"), patch("translator.ui.cli.ensure_model", return_value=False):
+            self.assertFalse(cli.select_model(cfg))
         self.assertEqual(cfg, {"model": main.DEFAULT_MODEL})
 
     def test_custom_model_survives_config_reload(self):

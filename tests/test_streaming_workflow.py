@@ -25,8 +25,8 @@ class StreamingTests(unittest.TestCase):
             text = "レオン" + url.rsplit("/", 1)[-1]
             return SourceChapter(url, title, [text], [{"type": "text", "text": text}])
         stack.enter_context(patch("translator.acquisition.network_workflow.sync_playwright"))
-        stack.enter_context(patch("translator.engine._launch_context", return_value=self.context))
-        stack.enter_context(patch("translator.engine.select_active_page"))
+        stack.enter_context(patch("translator.acquisition.browser_session.launch_context", return_value=self.context))
+        stack.enter_context(patch("translator.acquisition.browser_session.select_active_page"))
         stack.enter_context(patch("translator.acquisition.network_workflow.open_work_page", return_value=False))
         stack.enter_context(patch("translator.acquisition.network_workflow.extract_work_info", return_value=self.work))
         self.fetch = stack.enter_context(patch("translator.acquisition.network_workflow.extract_source_chapter", side_effect=fetch or default_fetch))
@@ -42,6 +42,7 @@ class StreamingTests(unittest.TestCase):
 
     def test_acquisition_finishes_while_first_chapter_translation_is_blocked(self):
         first_started, all_acquired = threading.Event(), threading.Event()
+        browser_released = threading.Event()
         def wait(seconds, cfg):
             self.assertTrue(first_started.wait(5))
         def stage(kind, message):
@@ -51,12 +52,15 @@ class StreamingTests(unittest.TestCase):
             if episode.url == "epub://chapter_0001":
                 first_started.set()
                 self.assertTrue(all_acquired.wait(5), "Acquisition waited for translation")
+                self.assertTrue(browser_released.wait(5), "Browser stayed reserved until translation finished")
                 state = load_json(network_path(self.url, cfg), {})
                 self.assertEqual(state["acquired_chapters"], 9)
+                self.assertTrue(state["acquisition_complete"])
             return self.normal_translate(episode, cfg, work_dir)
         with TemporaryDirectory() as folder, ExitStack() as stack:
             cfg = self.setup_pipeline(stack, folder, translate, wait=wait)
             cfg["_task_stage"] = stage
+            cfg["_acquisition_finished"] = browser_released.set
             self.work.episodes = [
                 {"url": self.url + f"/episodes/{i}", "title": f"第{i}章"}
                 for i in range(1, 10)]
@@ -127,6 +131,31 @@ class StreamingTests(unittest.TestCase):
             _, output, _ = run_streaming_workflow(self.url, cfg, "zh-Hans")
             self.assertTrue(output.exists())
             self.assertEqual(len(load_translation_state(project_path)["chapters"]), 4)
+
+    def test_resume_from_complete_original_preserves_streamed_translations(self):
+        acquired = threading.Event()
+        def translate(episode, cfg, work_dir):
+            if episode.url == "epub://chapter_0002":
+                self.assertTrue(acquired.wait(5))
+                raise RuntimeError("interrupted")
+            return self.normal_translate(episode, cfg, work_dir)
+        with TemporaryDirectory() as folder, ExitStack() as stack:
+            cfg = self.setup_pipeline(stack, folder, translate)
+            cfg["_task_stage"] = lambda kind, message: acquired.set() if kind == "acquisition" and message == "获取完成" else None
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                run_streaming_workflow(self.url, cfg, "zh-Hans")
+            project_path = next(Path(folder).rglob("translation-project.json"))
+            before = load_translation_state(project_path)["chapters"]
+            saved = load_json(network_path(self.url, cfg), {})
+            self.assertTrue(saved["acquisition_complete"])
+            self.translate.side_effect = self.normal_translate
+            self.translate.reset_mock()
+            output = main.translate_epub_language(Path(saved["source"]), cfg, "zh-Hans")
+            self.assertTrue(output.exists())
+            after = load_translation_state(project_path)
+            self.assertEqual(len(after["chapters"]), 3)
+            self.assertEqual(after["chapters"][:1], before)
+            self.assertNotIn("epub://chapter_0001", [call.args[0].url for call in self.translate.call_args_list])
 
     def test_acquisition_error_is_reported_without_exporting_incomplete_book(self):
         def fetch(page, url, title):

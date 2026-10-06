@@ -358,7 +358,8 @@ def export_to_json(entries: list[GlossaryEntry], path: Path, structured: bool = 
         data = [asdict(e) for e in entries]
     else:
         data = entries_to_dict(entries)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    from translator.storage.project_storage import atomic_json
+    atomic_json(path, data)
 
 
 def export_glossary_to_file(entries: list[GlossaryEntry], path: Path | str) -> None:
