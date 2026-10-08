@@ -9,6 +9,15 @@ from translator.glossary.manager import GlossaryEntry, load_project_glossary, sa
 
 
 class FirstTermsTests(unittest.TestCase):
+    def test_context_limit_splits_extraction(self):
+        from translator.engine import OllamaContextLimitExceeded
+        with tempfile.TemporaryDirectory() as folder, patch("translator.engine.ollama_chat_content") as chat:
+            chat.side_effect = [OllamaContextLimitExceeded("context"),
+                                '{"entries":[]}', '{"entries":[]}']
+            capture_terms(["レオン", "アリス"], ["里昂", "爱丽丝"], {"model": "test"}, folder)
+            self.assertEqual([len(json.loads(call.args[0]["messages"][1]["content"]))
+                              for call in chat.call_args_list], [2, 1, 1])
+
     def test_output_limit_splits_extraction_without_saving_truncated_json(self):
         from translator.engine import OllamaOutputLimitExceeded
         with tempfile.TemporaryDirectory() as folder, patch("translator.engine.ollama_chat_content") as chat:

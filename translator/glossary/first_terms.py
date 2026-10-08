@@ -9,7 +9,8 @@ from translator.glossary.manager import GlossaryEntry, load_project_glossary, me
 
 
 def capture_terms(originals, translations, cfg, work_dir):
-    from translator.engine import ollama_chat_content, check_translation_cancelled, OllamaOutputLimitExceeded
+    from translator.engine import (ollama_chat_content, check_translation_cancelled,
+                                   OllamaOutputLimitExceeded, OllamaContextLimitExceeded)
     pairs = list(zip(originals, translations))
     checkpoint_path = Path(work_dir) / "glossary-extraction.json"
     checkpoint = load_json(checkpoint_path, {})
@@ -54,6 +55,19 @@ def capture_terms(originals, translations, cfg, work_dir):
             {"role": "user", "content": json.dumps(batch, ensure_ascii=False)}]}
         try:
             content = ollama_chat_content(payload, {**cfg, "_output_label": "术语提取"})
+        except OllamaContextLimitExceeded:
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                return extract(batch[:midpoint], budget) + extract(batch[midpoint:], budget)
+            pair = batch[0]
+            if max(len(pair["source"]), len(pair["translation"])) <= 128:
+                raise
+            pieces = []
+            for index in range(2):
+                pieces.append({key: value[max(0, len(value) * index // 2 - 32):
+                                          min(len(value), len(value) * (index + 1) // 2 + 32)]
+                               for key, value in pair.items()})
+            return extract([pieces[0]], budget) + extract([pieces[1]], budget)
         except OllamaOutputLimitExceeded:
             if len(batch) > 1:
                 midpoint = len(batch) // 2

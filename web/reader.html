@@ -55,6 +55,14 @@ $('toggle-directory').onclick=()=>directory($('directory').hidden);$('close-dire
 function selectChapter(id){savePosition();clearTimeout(positionTimer);newChapterCount=0;current=id;revision=-1;record=null;save('reader-chapter:'+book,current);if(innerWidth<=1100)directory(false);poll()}
 function navigation(){const peers=catalogChapters.filter(c=>c.language===catalogChapters.find(c=>c.id===current)?.language),i=peers.findIndex(c=>c.id===current);$('previous').disabled=i<=0;$('next').disabled=i<0||i>=peers.length-1;$('previous').onclick=()=>selectChapter(peers[i-1].id);$('next').onclick=()=>selectChapter(peers[i+1].id);document.querySelectorAll('#volume-list button').forEach(b=>{if(b.dataset.id===current)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')})}
 function buildDirectory(chapters){const signature=JSON.stringify(chapters.map(c=>[c.id,c.title,c.volume,c.language]));if(signature===catalogSignature)return;catalogSignature=signature;const opened=new Set([...$('volume-list').querySelectorAll('details[open]')].map(d=>d.dataset.group));$('volume-list').replaceChildren();const groups=new Map();chapters.forEach(c=>{const group=c.language+' \u00b7 '+c.volume;if(!groups.has(group))groups.set(group,[]);groups.get(group).push(c)});groups.forEach((items,group)=>{const d=document.createElement('details');d.dataset.group=group;d.open=opened.has(group)||items.some(c=>c.id===current);const summary=document.createElement('summary');summary.textContent=group+'\uff08'+items.length+'\u7ae0\uff09';d.append(summary);items.forEach(c=>{const b=document.createElement('button');b.textContent=c.title;b.dataset.id=c.id;b.onclick=()=>selectChapter(c.id);d.append(b)});$('volume-list').append(d)})}
+let lastIdleActivity=-Infinity;
+for(const event of ['pointerdown','keydown','input','wheel','scroll']){
+    document.addEventListener(event,e=>{
+        if(!e.isTrusted||Date.now()-lastIdleActivity<1000)return;
+        lastIdleActivity=Date.now();
+        fetch(base+'activity').catch(()=>{});
+    },{passive:true,capture:true});
+}
 let pending=false,pollAgain=false,pollTimer=null;
 async function readerFetch(url){
     const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),10000);

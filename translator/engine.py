@@ -162,6 +162,10 @@ class OllamaOutputLimitExceeded(RuntimeError):
     """The model exhausted its output budget before completing the response."""
 
 
+class OllamaContextLimitExceeded(requests.HTTPError):
+    """The server rejected a prompt exceeding its context window."""
+
+
 def _read_ollama_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
     base = cfg["ollama_url"].rstrip("/")
     streamed_payload = dict(payload)
@@ -180,7 +184,11 @@ def _read_ollama_content(payload: dict[str, Any], cfg: dict[str, Any]) -> str:
                 details = response.json().get("error", response.text)
             except (ValueError, AttributeError):
                 details = response.text
-            raise requests.HTTPError(
+            error_type = (OllamaContextLimitExceeded if response.status_code == 400 and
+                          any(marker in str(details).lower() for marker in
+                              ("exceed_context_size", "exceeds the available context size"))
+                          else requests.HTTPError)
+            raise error_type(
                 f"Ollama 请求失败（HTTP {response.status_code}，模型 {payload.get('model', '')}）：{str(details)[:2000]}",
                 response=response, request=exc.request) from exc
         content_parts: list[str] = []
@@ -314,6 +322,22 @@ def translate_chunk(
             content = translation_only(content)
         if len(content) > max(512, source_chars * 6):
             raise RuntimeError("Ollama 输出达到长度限制：生成内容远超原文长度。")
+    except OllamaContextLimitExceeded:
+        if cfg.get("_batch_degraded"):
+            cfg["_batch_degraded"]()
+        glossary = cfg.get("glossary", {})
+        source_text = "\n".join(paragraphs)
+        relevant = {source: target for source, target in glossary.items() if source in source_text}
+        if len(relevant) < len(glossary):
+            return translate_chunk(paragraphs, {**cfg, "glossary": relevant}, previous_context,
+                                   _repeat_retry=_repeat_retry)
+        if len(paragraphs) > 1:
+            midpoint = len(paragraphs) // 2
+            return (translate_chunk(paragraphs[:midpoint], cfg, previous_context) +
+                    translate_chunk(paragraphs[midpoint:], cfg, previous_context))
+        if previous_context:
+            return translate_chunk(paragraphs, cfg, "", _repeat_retry=_repeat_retry)
+        raise
     except ThinkingBudgetExceeded:
         if cfg.get("_batch_degraded"):
             cfg["_batch_degraded"]()
@@ -905,6 +929,8 @@ def translate_epub_language(source: Path, cfg: dict[str, Any], language: str,
         metadata, chapters = dict(cfg["_stream_metadata"]), cfg["_stream_prefix"]
     else:
         metadata, chapters = extract_epub_chapters(source, work_dir / "assets")
+    if cfg.get("_translation_metadata_ready"):
+        cfg["_translation_metadata_ready"](metadata)
     source_chapters = chapters
     source_chapter_count = len(chapters)
     streaming = cfg.get("_chapter_stream") is not None

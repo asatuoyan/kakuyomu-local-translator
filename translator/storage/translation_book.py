@@ -11,6 +11,28 @@ from translator.acquisition.source_epub import SourceChapter, compute_content_ha
 from translator.domain import safe_name
 
 
+def export_completed_chapters(work_dir: Path) -> tuple[bytes, str]:
+    """Export a saved chapter snapshot without changing translation progress."""
+    from tempfile import TemporaryDirectory
+
+    state = load_translation_state(work_dir / "translation-project.json")
+    records = state.get("chapters", [])
+    if not records:
+        raise ValueError("尚无已完成的翻译章节可下载")
+    language = state.get("language", "zh-Hans")
+    metadata = dict(state["metadata"])
+    chapters = [SourceChapter(url=record["url"], title=record["title"],
+                              paragraphs=record["paragraphs"], blocks=record.get("blocks") or
+                              [{"type": "text", "text": p} for p in record["paragraphs"]],
+                              images=record.get("images", [])) for record in records]
+    filename = (f"{safe_name(metadata['title'])}_{language_suffix(language)}"
+                f"_已完成_{len(chapters)}章.epub")
+    with TemporaryDirectory(prefix="translation-export-") as temporary:
+        output = Path(temporary) / filename
+        translated_source_epub(metadata, chapters, output, language)
+        return output.read_bytes(), filename
+
+
 class TranslationBook:
     """Persist completed chapters and build small EPUBs before merging the full book."""
 

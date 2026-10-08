@@ -8,6 +8,19 @@ const completedList = document.createElement('details');
 const completedSummary = document.createElement('summary'); completedSummary.textContent = '最近完成';
 const completedRows = document.createElement('div'); completedList.append(completedSummary, completedRows);
 const queueStatus = document.createElement('p'); queueStatus.className = 'muted';
+const idleCloseStatus = document.createElement('p'); idleCloseStatus.className = 'muted';
+const idleCloseToggle = button('取消自动关闭', async () => {
+    await api('idle-close', {enabled: !state.idle_close?.enabled}); await poll();
+});
+let lastIdleActivity = -Infinity;
+function recordIdleActivity(event) {
+    if (!event.isTrusted || Date.now() - lastIdleActivity < 1000) return;
+    lastIdleActivity = Date.now();
+    api('activity', {}).catch(() => {});
+}
+for (const event of ['pointerdown', 'keydown', 'input', 'wheel', 'scroll']) {
+    document.addEventListener(event, recordIdleActivity, {passive: true, capture: true});
+}
 const pauseQueue = button('暂停全部', async () => { await api('queue-control', {paused: !state.queue_paused}); await poll(); });
 const diagnosticDownload = button('导出诊断信息', async () => {
     const data = await api('diagnostics', {});
@@ -17,9 +30,9 @@ const diagnosticDownload = button('导出诊断信息', async () => {
 });
 const backupEntry = button('备份与恢复', () => { tab('terms'); backupsPanel.open = true; backupsPanel.scrollIntoView({block: 'start'}); });
 const queueToolbar = document.createElement('div'); queueToolbar.className = 'actions';
-queueToolbar.append(pauseQueue, moreActions(backupEntry, diagnosticDownload));
+queueToolbar.append(pauseQueue, idleCloseToggle, moreActions(backupEntry, diagnosticDownload));
 queuePanel.id = 'taskQueue';
-queuePanel.append(queueTitle, queueToolbar, queueStatus, activeList, queueList, completedList); $('translatePage').append(queuePanel);
+queuePanel.append(queueTitle, queueToolbar, queueStatus, idleCloseStatus, activeList, queueList, completedList); $('translatePage').append(queuePanel);
 function showQueueSubmission(result) {
     notice(result.duplicate ? '该小说已有任务，已定位；可在队列中继续或重试' : state?.queue_paused ? '已加入队列，等待继续队列' : '已加入队列，空闲时自动开始');
     tab('translate');
@@ -40,6 +53,12 @@ for (const [slot, parent] of [['translation', $('message')], ['acquisition', $('
 }
 let queueFingerprint = '';
 function renderTaskTools() {
+    const idle = state.idle_close;
+    idleCloseToggle.textContent = idle?.enabled ? '取消自动关闭' : '启用自动关闭';
+    idleCloseToggle.disabled = !!state.restart_pending;
+    idleCloseStatus.textContent = !idle?.enabled ? '自动关闭已取消。' : idle.remaining_seconds == null ?
+        '队列全部完成后，无操作一小时自动关闭翻译程序；操作会重新计时。' :
+        `队列已完成，${Math.floor(idle.remaining_seconds / 60)} 分 ${idle.remaining_seconds % 60} 秒后自动关闭翻译程序；操作会重新计时。`;
     pauseQueue.textContent = state.queue_paused ? '继续队列' : '暂停全部';
     pauseQueue.disabled = !!state.restart_pending;
     activeList.replaceChildren();

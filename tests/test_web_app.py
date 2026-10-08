@@ -188,7 +188,7 @@ class WebAppTests(unittest.TestCase):
         self.app.task["running"] = True
         with urlopen(self.server.url + "api/download?file=" + book["source_download"].replace("\\", "/")) as response:
             self.assertEqual(response.read(), b"completed original")
-            self.assertIn("original.epub", response.headers["Content-Disposition"])
+            self.assertIn("filename=\"Original.epub\"", response.headers["Content-Disposition"])
         self.app.task["running"] = False
         with patch.object(self.app, "enqueue", return_value={"queued": True}) as enqueue:
             self.post("resume", {"project": book["id"], "model": "chosen", "language": "en"})
@@ -294,6 +294,8 @@ class WebAppTests(unittest.TestCase):
             (self.project / "book.epub").write_bytes(b"epub")
             with urlopen(self.server.url + "api/download?file=book/book.epub") as response:
                 self.assertEqual(response.read(), b"epub")
+                from urllib.parse import quote
+                self.assertIn("filename*=UTF-8''" + quote("测试小说.epub"), response.headers["Content-Disposition"])
         finally:
             self.app.reader.close()
 

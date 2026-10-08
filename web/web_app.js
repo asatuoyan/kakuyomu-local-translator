@@ -80,6 +80,14 @@ function downloadLink(file, label = '下载 EPUB') {
     return link;
 }
 
+function completedDownloadLink(project) {
+    const link = document.createElement('a');
+    link.className = 'button';
+    link.textContent = '下载已完成部分';
+    link.href = 'api/download-completed?project=' + encodeURIComponent(project);
+    return link;
+}
+
 function tab(page) {
     if (page !== 'terms' && $('reviewPanel')) $('reviewPanel').hidden = true;
     for (const name of ['translate', 'books', 'terms']) {
@@ -186,6 +194,9 @@ function renderBooks() {
             }
             if (project.source_download) secondaryActions.push(downloadLink(project.source_download, '下载原文'));
             if (project.download) secondaryActions.push(downloadLink(project.download));
+            if (project.kind !== 'source' && project.chapters > 0 && !project.completed) {
+                secondaryActions.push(completedDownloadLink(project.id));
+            }
             if (project.update_url && project.source_download) {
                 for (const [translate, label] of [[true, '检查更新并翻译'], [false, '仅更新原文']]) {
                     const check = button(label, async () => {

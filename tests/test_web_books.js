@@ -37,6 +37,7 @@ function setup(projects) {
         downloadLink: (_, label = '下载 EPUB') => Object.assign(new Element(), {textContent: label})
     });
     vm.runInContext(source.slice(source.indexOf('function moreActions('), source.indexOf("document.addEventListener('click'")), context);
+    vm.runInContext(source.slice(source.indexOf('function completedDownloadLink('), source.indexOf('function tab(')), context);
     vm.runInContext(source.slice(source.indexOf('function renderBooks()'), source.indexOf('function renderStatus()')), context);
     context.renderBooks();
     return {context, $};
@@ -46,6 +47,18 @@ const projects = Array.from({length: 23}, (_, index) => ({
     id: `book-${index}`, title: `Novel ${index}`, language: 'en', chapters: index,
     completed: index % 2 === 0, resume: {}, download: 'book.epub'
 }));
+
+test('unfinished translations offer a snapshot download only after a chapter is saved', () => {
+    const { $ } = setup([
+        {id: 'partial/book', title: 'Partial', chapters: 1, completed: false},
+        {id: 'empty', title: 'Empty', chapters: 0, completed: false}
+    ]);
+    const actions = $('books').children.map(row => row.children[1].children);
+    assert.equal(actions[0].some(item => item.textContent === '下载已完成部分'), false);
+    const link = actions[0].at(-1).children[1].children.find(item => item.textContent === '下载已完成部分');
+    assert.equal(link.href, 'api/download-completed?project=partial%2Fbook');
+    assert.equal(actions[1].some(item => item.textContent === '下载已完成部分'), false);
+});
 
 test('network books can queue incremental updates with or without follow-up translation', async () => {
     const {context, $} = setup([{id: 'book', title: 'fixture', kind: 'source', completed: true,

@@ -51,7 +51,7 @@ def physical_lan_addresses():
 
 
 class ReadingServer:
-    def __init__(self):
+    def __init__(self, activity_callback=None):
         self.lock = threading.Lock()
         self.book = ""
         self.saved = None
@@ -78,7 +78,12 @@ class ReadingServer:
                     saved = owner.saved if token == owner.token else owner.saved_books.get(token)
                     live_book, live_chapters = ((owner.book, owner.chapters) if token == owner.token
                                                 else owner.live_books.get(token, ("", {})))
-                if route == "/":
+                if route in ("/", "/activity") and activity_callback:
+                    activity_callback()
+                if route == "/activity":
+                    data = b'{}'
+                    mime = "application/json; charset=utf-8"
+                elif route == "/":
                     if token == owner.token and saved is not None:
                         self.send_response(302)
                         self.send_header("Location", urlsplit(owner.open_book(saved)).path)

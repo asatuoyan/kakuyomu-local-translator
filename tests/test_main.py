@@ -99,6 +99,22 @@ class OllamaChatContentTests(unittest.TestCase):
 
 class TranslationBatchTests(unittest.TestCase):
     @patch("translator.engine.ollama_chat_content")
+    def test_context_limit_retains_only_relevant_terms(self, chat):
+        chat.side_effect = [main.OllamaContextLimitExceeded("context"), "里昂"]
+        cfg = {**self.cfg, "glossary": {"レオン": "里昂", "アリス": "爱丽丝"}}
+        self.assertEqual(main.translate_chunk(["レオン"], cfg), ["里昂"])
+        prompt = chat.call_args.args[0]["messages"][0]["content"]
+        self.assertIn("レオン 翻译成 里昂", prompt)
+        self.assertNotIn("アリス", prompt)
+        self.assertEqual(len(cfg["glossary"]), 2)
+
+    @patch("translator.engine.ollama_chat_content")
+    def test_context_limit_splits_translation_batch(self, chat):
+        chat.side_effect = [main.OllamaContextLimitExceeded("context"), "譯一", "譯二"]
+        self.assertEqual(main.translate_chunk(["一", "二"], self.cfg), ["譯一", "譯二"])
+        self.assertEqual(chat.call_count, 3)
+
+    @patch("translator.engine.ollama_chat_content")
     def test_runaway_short_title_retries_once_without_context(self, chat):
         chat.side_effect = ["x" * 513, "基本常识"]
         self.assertEqual(main.translate_chunk(["基本的なことを学ぶ"], self.cfg, "previous"),

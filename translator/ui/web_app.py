@@ -13,7 +13,7 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit, parse_qs
+from urllib.parse import urlsplit, parse_qs, quote
 
 from translator.config import load_config, update_config
 from translator.version import VERSION
@@ -29,9 +29,10 @@ from translator.ui.web_queue import QueueMixin
 from translator.ui.web_backups import BackupMixin
 from translator.ui.web_book_updates import BookUpdatesMixin
 from translator.ui.web_diagnostics import DiagnosticsMixin
+from translator.ui.web_idle import IdleCloseMixin
 
 
-class Application(LibraryMixin, RecoveryMixin, QueueMixin, BackupMixin, BookUpdatesMixin, DiagnosticsMixin):
+class Application(LibraryMixin, RecoveryMixin, QueueMixin, BackupMixin, BookUpdatesMixin, DiagnosticsMixin, IdleCloseMixin):
     def __init__(self, cfg=None):
         self.cfg = cfg or load_config()
         self.lock = threading.RLock()
@@ -63,6 +64,7 @@ class Application(LibraryMixin, RecoveryMixin, QueueMixin, BackupMixin, BookUpda
         self._recovery_started = False
         self._recovery_retry_delay = 10
         self.init_queue()
+        self.init_idle_close()
         self.init_diagnostics()
         self.recover_backup_transactions()
 
@@ -161,7 +163,8 @@ class Application(LibraryMixin, RecoveryMixin, QueueMixin, BackupMixin, BookUpda
                    _automatic_browser_login=True,
                    _acquisition_finished=lambda: self._release_browser(browser_owner),
                    _translation_activity=self.model_activity, _task_stage=self.stage,
-                   _translation_project_ready=self.project_ready)
+                   _translation_project_ready=self.project_ready,
+                   _translation_metadata_ready=self.metadata_ready)
         def worker():
             from translator.engine import translate_epub_language, translation_work_dir, TranslationCancelled
             try:
@@ -181,7 +184,7 @@ class Application(LibraryMixin, RecoveryMixin, QueueMixin, BackupMixin, BookUpda
                                      project=str(work_dir.relative_to(Path(cfg["output_dir"]))))
                     self.task["stages"].update(acquisition="获取完成" if url else "本地 EPUB，无需获取",
                                               translation="翻译完成", glossary="术语整理完成")
-                    self.finish_queue_task("translation", body, body.get("title") or actual.stem, self.task["project"])
+                    self.finish_queue_task("translation", body, self.task["title"], self.task["project"])
                     self.recovery.clear("translation", job_id)
             except TranslationCancelled:
                 self.progress(None, "已暂停，已保存章节可续译")
@@ -250,6 +253,12 @@ class Application(LibraryMixin, RecoveryMixin, QueueMixin, BackupMixin, BookUpda
     def pipeline_counts(self, counts):
         with self.lock:
             self.task["counts"] = counts
+
+    def metadata_ready(self, metadata):
+        title = metadata.get("title")
+        if isinstance(title, str) and title.strip():
+            with self.lock:
+                self.task["title"] = title.strip()
 
     def project_ready(self, path):
         with self.lock:
@@ -493,7 +502,9 @@ def create_server(app, port=0, *, session_token=None):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             if attachment:
-                self.send_header("Content-Disposition", f'attachment; filename="{attachment}"')
+                fallback = attachment if attachment.isascii() else "download" + Path(attachment).suffix
+                fallback = fallback.replace('"', '_').replace('\\', '_').replace('\r', '_').replace('\n', '_')
+                self.send_header("Content-Disposition", f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(attachment, safe="")}')
             self.end_headers()
             self.wfile.write(data)
 
@@ -505,6 +516,8 @@ def create_server(app, port=0, *, session_token=None):
                 return
             query = parse_qs(parsed.query)
             try:
+                if route in ("/", "/api/download", "/api/download-completed", "/api/export"):
+                    app.note_activity()
                 if route == "/":
                     page = (WEB_DIR / "web_app.html").read_text(encoding="utf-8")
                     snapshot = app.updates.snapshot(force=True)
@@ -535,13 +548,21 @@ def create_server(app, port=0, *, session_token=None):
                 elif route == "/api/examples":
                     self.send(app.term_examples(app.project(query.get("project", [""])[0]),
                                                 query.get("source", [""])[0]))
+                elif route == "/api/download-completed":
+                    from translator.storage.translation_book import export_completed_chapters
+                    data, filename = export_completed_chapters(app.project(query.get("project", [""])[0]))
+                    self.send(data, "application/epub+zip", attachment=filename)
                 elif route == "/api/download":
                     root = Path(app.cfg["output_dir"]).resolve()
                     path = (root / query.get("file", [""])[0]).resolve()
                     if not path.is_relative_to(root) or path.suffix.lower() != ".epub" or not path.is_file():
                         raise ValueError("EPUB 不存在")
-                    self.send(path.read_bytes(), "application/epub+zip", attachment=(
-                        "original.epub" if path.parent.parent.name == "network-workflows" else "translation.epub"))
+                    from translator.domain import safe_name
+                    project = load_json(path.parent / "translation-project.json", {})
+                    network = load_json(path.parent / "network.json", {})
+                    title = (project.get("metadata", {}).get("title") or
+                             network.get("work", {}).get("title") or path.stem)
+                    self.send(path.read_bytes(), "application/epub+zip", attachment=safe_name(title) + ".epub")
                 else:
                     self.send({"error": "Not found"}, status=404)
             except (ValueError, OSError, KeyError, RuntimeError) as exc:
@@ -559,7 +580,12 @@ def create_server(app, port=0, *, session_token=None):
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("请求必须是对象")
-                if route.endswith("/enqueue"):
+                app.note_activity()
+                if route.endswith("/activity"):
+                    result = {"recorded": True}
+                elif route.endswith("/idle-close"):
+                    result = app.control_idle_close(body.get("enabled"))
+                elif route.endswith("/enqueue"):
                     result = app.enqueue(body.get("slot"), body.get("task", {}))
                 elif route.endswith("/queue-control"):
                     result = app.control_queue(body.get("paused"))
@@ -624,7 +650,7 @@ def create_server(app, port=0, *, session_token=None):
                     from translator.ui.web_reader import ReadingServer
                     with app.lock:
                         if app.reader is None:
-                            app.reader = ReadingServer()
+                            app.reader = ReadingServer(activity_callback=app.note_activity)
                         reader = app.reader
                     result = {"url": reader.open_path(
                         app.project(body["project"]) / "translation-project.json")}
@@ -652,6 +678,13 @@ def serve(args):
         restarting.set()
         server.shutdown()
     app.restart_callback = restart
+    def watch_idle():
+        while not app.closing.wait(1):
+            if app.idle_close_status(close_if_due=True)["closing"]:
+                print("队列已完成且一小时无操作，正在关闭翻译程序。", flush=True)
+                server.shutdown()
+                return
+    threading.Thread(target=watch_idle, daemon=True).start()
     if args.supervised:
         parent_pipe = sys.stdin.fileno()
         def watch_parent():

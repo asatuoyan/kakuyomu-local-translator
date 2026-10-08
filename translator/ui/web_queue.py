@@ -161,7 +161,7 @@ class QueueMixin:
             identity = body.pop("_queue_id", None) or secrets.token_hex(12)
             task = self.task if slot == "translation" else self.acquisition_task
             item = {"id": identity, "slot": slot, "body": body, "status": status,
-                    "title": body.get("title") or task.get("title") or Path(body.get("source", "")).stem or "等待获取书名"}
+                    "title": task.get("title") or body.get("title") or Path(body.get("source", "")).stem or "等待获取书名"}
             if error:
                 item["error"] = error
             self._save_queue([entry for entry in self.queued_tasks if entry["id"] != identity] + [item])
@@ -192,6 +192,8 @@ class QueueMixin:
             self.completed_tasks = [*self.completed_tasks, {"slot": slot, "title": title,
                 "project": project, "finished_at": time.time()}][-5:]
             self._save_queue([item for item in self.queued_tasks if item["id"] != body.get("_queue_id")])
+            self._idle_completed = True
+            self._idle_since = None
 
     def control_queue(self, paused):
         if not isinstance(paused, bool):

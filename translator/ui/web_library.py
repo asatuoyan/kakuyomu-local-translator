@@ -155,6 +155,7 @@ class LibraryMixin:
     def status(self):
         with self.lock:
             return {"task": dict(self.task), "restart_pending": self.restart_requested,
+                    "idle_close": self.idle_close_status(),
                     "acquisition_task": dict(self.acquisition_task),
                     "acquisition_busy": self._browser_owner is not None, "projects": self.projects(),
                     "history": self.recent_tasks(), "queue": self.queued_tasks, "completed_tasks": self.completed_tasks, "queue_error": self.queue_error, "queue_paused": self.queue_paused,

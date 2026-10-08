@@ -6,6 +6,25 @@ const {test} = require('node:test');
 const app = fs.readFileSync(path.join(__dirname, '..', 'web', 'web_app.js'), 'utf8');
 const reader = fs.readFileSync(path.join(__dirname, '..', 'web', 'reader.html'), 'utf8');
 
+test('user interaction resets idle countdown while synthetic events do not', () => {
+    const tasks = fs.readFileSync(path.join(__dirname, '..', 'web', 'web_tasks.js'), 'utf8');
+    const listeners = new Map(), requests = [];
+    let now = 1000;
+    const context = vm.createContext({Date: {now: () => now},
+        document: {addEventListener: (event, handler) => listeners.set(event, handler)},
+        api: (route, body) => { requests.push({route, body}); return Promise.resolve({}); }});
+    vm.runInContext(tasks.slice(tasks.indexOf('let lastIdleActivity'), tasks.indexOf('const pauseQueue')), context);
+    listeners.get('scroll')({isTrusted: false});
+    assert.equal(requests.length, 0);
+    listeners.get('pointerdown')({isTrusted: true});
+    assert.equal(requests[0].route, 'activity');
+    listeners.get('input')({isTrusted: true});
+    assert.equal(requests.length, 1);
+    now += 1000;
+    listeners.get('keydown')({isTrusted: true});
+    assert.equal(requests.length, 2);
+});
+
 test('dynamic queue buttons never submit their surrounding task form', () => {
     const context = vm.createContext({document: {createElement: () => ({})}});
     vm.runInContext(app.slice(app.indexOf('function button('), app.indexOf('function moreActions(')), context);

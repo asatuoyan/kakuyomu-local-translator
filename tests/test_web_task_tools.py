@@ -50,6 +50,14 @@ class TaskToolsTests(unittest.TestCase):
                     thread.join(2)
             self.wait(lambda: not app.task['running'] and not app.acquisition_task['running'])
 
+    def test_translation_metadata_replaces_internal_source_filename(self):
+        app = self.app()
+        app.task['title'] = 'source_598ceb02c855e49f'
+        app.metadata_ready({'title': '作品书名'})
+        self.assertEqual(app.task['title'], '作品书名')
+        app.metadata_ready({'title': ' '})
+        self.assertEqual(app.task['title'], '作品书名')
+
     def test_fifo_serializes_translation_and_cancel_removes_waiting_book(self):
         app = self.app()
         released = threading.Event()
